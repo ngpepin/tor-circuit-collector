@@ -1,0 +1,30 @@
+{
+  "tor": {
+    "socks_host": "127.0.0.1",
+    "socks_port": 9050,
+    "control_host": "127.0.0.1",
+    "control_port": 9051,
+    "control_password": "Oqv8rVupQB5f9g+QmVSoD4DnvqdGtL60"
+  },
+  "collector": {
+    "circuits": 5,
+    "keepalive_url": "https://check.torproject.org/api/ip",
+    "keepalive_interval": 60,
+    "max_keepalive_failures": 2,
+    "circuit_build_timeout": 90,
+    "leave_circuits": false,
+    "show_paths": false
+  },
+  "downloads": {
+    "output_dir": "downloads",
+    "keep_partials": false
+  },
+  "ui": {
+    "status_interval": 5
+  },
+  "timeouts": {
+    "connect_timeout": 20,
+    "read_timeout": 30,
+    "download_read_timeout": 120
+  }
+}
