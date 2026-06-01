@@ -127,6 +127,7 @@ class Slot:
     consecutive_keepalive_failures: int = 0
     bytes_since_last_url: int = 0
     last_url: str = ""
+    pending_resume_url: str = ""
     session_output: List[str] = field(default_factory=list)
     download: Optional[DownloadState] = None
     io_lock: threading.RLock = field(default_factory=threading.RLock)
@@ -458,6 +459,7 @@ class TorCircuitCollector:
             slot.download = None
             slot.bytes_since_last_url = 0
             slot.last_url = ""
+            slot.pending_resume_url = ""
             slot.last_error = ""
             slot.session_output = []
             slot.status = "ready"
@@ -755,6 +757,7 @@ class TorCircuitCollector:
         slot = self.slots[slot_index - 1]
         planned_exit = ""
         acquired_build_slot = False
+        session_to_close = None
 
         with self.lock:
             if slot.rebuilding:
@@ -763,6 +766,24 @@ class TorCircuitCollector:
             slot.status = "queued"
             slot.last_error = ""
             old_circuit = slot.circuit_id
+            allow_auto_resume = reason != "manual replace"
+
+            # If an active download was interrupted by a dropped/broken circuit,
+            # preserve its URL so we can resume after rebuilding succeeds.
+            resume_url = slot.pending_resume_url.strip() if allow_auto_resume else ""
+            active_state = slot.download
+            active_download = (
+                active_state is not None
+                and not active_state.done
+                and not active_state.error
+                and not active_state.cancel_requested
+            )
+            if allow_auto_resume and active_download and active_state is not None and active_state.url.strip():
+                resume_url = active_state.url.strip()
+                active_state.cancel_requested = True
+                session_to_close = self.sessions.pop(slot_index, None)
+
+            slot.pending_resume_url = resume_url
             slot.circuit_id = None
             slot.exit_fingerprint = ""
             slot.exit_nickname = ""
@@ -773,6 +794,12 @@ class TorCircuitCollector:
             slot.download = None
             slot.bytes_since_last_url = 0
             slot.last_url = ""
+
+        if session_to_close is not None:
+            try:
+                session_to_close.close()
+            except Exception:
+                pass
 
         if old_circuit and self.controller is not None:
             try:
@@ -846,6 +873,7 @@ class TorCircuitCollector:
                         exit_ip = ""
 
             now = time.monotonic()
+            resume_url = ""
             with self.lock:
                 if planned_exit:
                     self.reserved_exit_fingerprints.discard(planned_exit)
@@ -862,6 +890,8 @@ class TorCircuitCollector:
                 slot.download = None
                 slot.bytes_since_last_url = 0
                 slot.last_url = ""
+                resume_url = slot.pending_resume_url.strip()
+                slot.pending_resume_url = ""
 
                 # Do not immediately launch a keep-alive on a just-built circuit.
                 # It can race with the remaining initial circuit builds and makes
@@ -871,6 +901,9 @@ class TorCircuitCollector:
                 slot.last_ok_at = now
 
             self.set_message(f"Circuit {slot.index} ready as Tor circuit {circuit_id}.")
+            if resume_url and not self.stop_event.is_set():
+                self.append_slot_output(slot_index, f"Circuit rebuilt; resuming download: {resume_url}")
+                self.start_download(slot_index, resume_url)
         except Exception as exc:
             with self.lock:
                 if planned_exit:
@@ -1517,6 +1550,123 @@ def add_line(stdscr, row: int, text: str, attr: int = 0) -> None:
         stdscr.addnstr(row, 0, text.ljust(max(0, width - 1)), max(0, width - 1), attr)
 
 
+def fit_table_cell(value: str, width: int) -> str:
+    text = str(value)
+    if width <= 0:
+        return ""
+    if len(text) > width:
+        if width >= 4:
+            text = text[: width - 3] + "..."
+        else:
+            text = text[:width]
+    return text.ljust(width)
+
+
+def _proportional_adjust(
+    values: Dict[str, int],
+    limits: Dict[str, int],
+    delta: int,
+    shrink: bool,
+) -> Dict[str, int]:
+    if delta <= 0:
+        return values
+
+    updated = dict(values)
+    for _ in range(delta):
+        candidates = []
+        for key, current in updated.items():
+            limit = limits[key]
+            room = (current - limit) if shrink else (limit - current)
+            if room > 0:
+                # Use current width as weight so resizing stays proportional.
+                candidates.append((key, room, current))
+        if not candidates:
+            break
+
+        total_weight = sum(weight for _, _, weight in candidates)
+        best_key = candidates[0][0]
+        best_score = -1.0
+        for key, room, weight in candidates:
+            score = room * (weight / max(1, total_weight))
+            if score > best_score:
+                best_score = score
+                best_key = key
+
+        if shrink:
+            updated[best_key] -= 1
+        else:
+            updated[best_key] += 1
+
+    return updated
+
+
+def compute_table_widths(rows: List[Dict[str, str]], terminal_width: int) -> Dict[str, int]:
+    headers = {
+        "index": "#",
+        "circuit_id": "CircID",
+        "exit_label": "Exit relay",
+        "exit_ip": "Exit IP",
+        "age": "Age",
+        "last_ok": "Last OK",
+        "failures": "KA fail",
+        "kb_since_url": "KB URL",
+        "avg_mbps": "Avg Mbps",
+        "status": "Status",
+    }
+
+    min_widths = {
+        "index": 2,
+        "circuit_id": 6,
+        "exit_label": 10,
+        "exit_ip": 8,
+        "age": 5,
+        "last_ok": 7,
+        "failures": 7,
+        "kb_since_url": 7,
+        "avg_mbps": 8,
+        "status": 10,
+    }
+
+    preferred_caps = {
+        "index": 2,
+        "circuit_id": 12,
+        "exit_label": 30,
+        "exit_ip": 15,
+        "age": 8,
+        "last_ok": 8,
+        "failures": 8,
+        "kb_since_url": 10,
+        "avg_mbps": 8,
+        "status": 22,
+    }
+
+    preferred_widths: Dict[str, int] = {}
+    for key, header in headers.items():
+        data_max = max((len(str(row.get(key, ""))) for row in rows), default=0)
+        preferred_widths[key] = min(preferred_caps[key], max(len(header), data_max, min_widths[key]))
+
+    keys = list(headers.keys())
+    separators = len(keys) - 1
+    reserved_download = len(" Download")
+    available = max(1, terminal_width - reserved_download)
+    target_sum = max(sum(min_widths.values()), available - separators)
+
+    widths = dict(preferred_widths)
+    current_sum = sum(widths.values())
+    if current_sum > target_sum:
+        widths = _proportional_adjust(widths, min_widths, current_sum - target_sum, shrink=True)
+    elif current_sum < target_sum:
+        extra = target_sum - current_sum
+
+        # Keep most extra space for the trailing Download field.
+        # Only allow modest expansion for Exit relay to improve readability.
+        exit_room = max(0, preferred_caps["exit_label"] - widths["exit_label"])
+        exit_growth = min(exit_room, extra // 6, 12)
+        widths["exit_label"] += exit_growth
+
+    return widths
+
+
 UI_COLOR_ATTRS: Dict[str, int] = {}
 
 
@@ -1809,20 +1959,12 @@ def draw_ui(
     add_line(stdscr, 0, title[: width - 1], curses.A_BOLD)
     add_line(stdscr, 1, app.port_discovery_line[: width - 1], banner_attr(app.port_discovery_note))
     add_line(stdscr, 2, "─" * (width - 1))
-    add_line(
-        stdscr,
-        3,
-        "#  CircID   Exit relay           Exit IP         Age     Last OK  KA fail  KB URL  Avg Mbps Status              Download",
-        curses.A_BOLD,
-    )
 
     split_row = height // 2 if (viewer_slot is not None or history_view_active or failed_history_view_active) else height - 5
     table_bottom = max(4, split_row - 1)
 
-    row = 4
+    table_rows: List[Dict[str, str]] = []
     for slot in slots_snapshot:
-        if row >= table_bottom:
-            break
         with app.lock:
             circuit_id = slot.circuit_id or "-"
             exit_label = slot.exit_nickname or "-"
@@ -1846,26 +1988,76 @@ def draw_ui(
             if not last_error:
                 last_error = download_state.error
 
-        line = (
-            f"{slot.index:<2} {circuit_id:<8.8} {exit_label:<20.20} {exit_ip:<15.15} "
-            f"{age:<7} {last_ok:<8} {failures:<7} {kb_since_url:<7} {avg_mbps:<8} "
+        table_rows.append(
+            {
+                "index": str(slot.index),
+                "circuit_id": circuit_id,
+                "exit_label": exit_label,
+                "exit_ip": exit_ip,
+                "age": age,
+                "last_ok": last_ok,
+                "failures": failures,
+                "kb_since_url": kb_since_url,
+                "avg_mbps": avg_mbps,
+                "status": display_status,
+                "summary": summary,
+                "last_error": last_error,
+                "path_summary": path_summary,
+                "status_attr": str(circuit_status_attr(display_status)),
+                "summary_attr": str(download_summary_attr(download_state)),
+            }
         )
-        status_text = f"{display_status:<19.19}"
+
+    widths = compute_table_widths(table_rows, width - 1)
+    header_prefix = " ".join(
+        [
+            fit_table_cell("#", widths["index"]),
+            fit_table_cell("CircID", widths["circuit_id"]),
+            fit_table_cell("Exit relay", widths["exit_label"]),
+            fit_table_cell("Exit IP", widths["exit_ip"]),
+            fit_table_cell("Age", widths["age"]),
+            fit_table_cell("Last OK", widths["last_ok"]),
+            fit_table_cell("KA fail", widths["failures"]),
+            fit_table_cell("KB URL", widths["kb_since_url"]),
+            fit_table_cell("Avg Mbps", widths["avg_mbps"]),
+        ]
+    )
+    header_line = f"{header_prefix} {fit_table_cell('Status', widths['status'])} Download"
+    add_line(stdscr, 3, header_line, curses.A_BOLD)
+
+    row = 4
+    for data in table_rows:
+        if row >= table_bottom:
+            break
+        prefix = " ".join(
+            [
+                fit_table_cell(data["index"], widths["index"]),
+                fit_table_cell(data["circuit_id"], widths["circuit_id"]),
+                fit_table_cell(data["exit_label"], widths["exit_label"]),
+                fit_table_cell(data["exit_ip"], widths["exit_ip"]),
+                fit_table_cell(data["age"], widths["age"]),
+                fit_table_cell(data["last_ok"], widths["last_ok"]),
+                fit_table_cell(data["failures"], widths["failures"]),
+                fit_table_cell(data["kb_since_url"], widths["kb_since_url"]),
+                fit_table_cell(data["avg_mbps"], widths["avg_mbps"]),
+            ]
+        ) + " "
+        status_text = fit_table_cell(data["status"], widths["status"])
         add_circuit_row_colored(
             stdscr,
             row,
-            line,
+            prefix,
             status_text,
-            summary,
-            circuit_status_attr(display_status),
-            download_summary_attr(download_state),
+            data["summary"],
+            int(data["status_attr"]),
+            int(data["summary_attr"]),
         )
         row += 1
-        if last_error and row < table_bottom:
-            add_line(stdscr, row, f"   ↳ {last_error}"[: width - 1], UI_COLOR_ATTRS.get("error", 0))
+        if data["last_error"] and row < table_bottom:
+            add_line(stdscr, row, f"   ↳ {data['last_error']}"[: width - 1], UI_COLOR_ATTRS.get("error", 0))
             row += 1
-        if path_summary and app.args.show_paths and row < table_bottom:
-            add_line(stdscr, row, f"   path: {path_summary}"[: width - 1])
+        if data["path_summary"] and app.args.show_paths and row < table_bottom:
+            add_line(stdscr, row, f"   path: {data['path_summary']}"[: width - 1])
             row += 1
 
     if history_view_active:

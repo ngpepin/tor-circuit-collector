@@ -235,6 +235,7 @@ No Enter needed for these actions:
 - Press `P` to paste the clipboard URL into the next available circuit and start immediately.
 - Press `H` to open a scrollable successful-download history pane, with most recent entries at the top.
 - Press `F` to open a scrollable failed-download history pane.
+- If a circuit drops during an active download, the app rebuilds that circuit and automatically re-initiates the interrupted URL after the circuit is ready.
 - Failed history excludes any URL that later succeeded.
 - If a URL fails multiple times and has not succeeded yet, only its most recent failure is shown.
 - Press `C` or `c` while viewing success history or failed history to clear that list.
@@ -245,6 +246,8 @@ No Enter needed for these actions:
 - Press `q` to quit.
 
 The UI shows each circuit's current Tor circuit ID, exit relay, age, keep-alive status, failure count, KB downloaded since last URL, average Mbps for the current/last transfer, and download progress.
+
+Table columns auto-resize with terminal width: they shrink proportionally when space is tight, and when space is abundant most extra width is reserved for the `Download` field with only limited growth in `Exit relay`.
 
 Status display and colors:
 
