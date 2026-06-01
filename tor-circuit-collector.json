@@ -2,10 +2,10 @@
   "tor": {
     "socks_host": "127.0.0.1",
     "socks_port": 9050,
-    "socks_port_candidates": [9150],
+    "socks_port_candidates": [9150,9160,9170,9180,9190],
     "control_host": "127.0.0.1",
     "control_port": 9051,
-    "control_port_candidates": [9151],
+    "control_port_candidates": [9151,9161,9171,9181,9191],
     "control_port_scan_radius": 10,
     "port_probe_timeout": 0.6,
     "control_password": "Oqv8rVupQB5f9g+QmVSoD4DnvqdGtL60"
@@ -16,7 +16,13 @@
     "keepalive_urls": [
       "https://check.torproject.org/api/ip",
       "https://api.ipify.org?format=json",
-      "https://icanhazip.com"
+      "https://icanhazip.com",
+      "https://google.com",
+      "https://microsoft.com",
+      "https://github.com",
+      "https://twitter.com",
+      "https://facebook.com",
+      "https://amazon.com"
     ],
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
@@ -29,7 +35,7 @@
     "keep_partials": false
   },
   "ui": {
-    "status_interval": 5
+    "status_interval": 3
   },
   "timeouts": {
     "connect_timeout": 20,
