@@ -2,7 +2,7 @@
 
 `tor-circuit-collector` is a Python terminal application that maintains a small pool of Tor circuits, keeps idle circuits warm, and lets you choose a numbered circuit for an HTTP(S) download such as a PDF or EPUB.
 
-The interface uses an in-place `curses` display, so status refreshes do not scroll the terminal. By default, it maintains **5 circuits** and refreshes the CLI every **5 seconds**.
+The interface uses an in-place `curses` display, so status refreshes do not scroll the terminal. By default, it maintains **9 circuits** and refreshes the CLI every **5 seconds**.
 
 ## Files
 
@@ -16,14 +16,76 @@ README.md                     This file
 ## What it does
 
 - Connects to Tor through the Tor ControlPort.
+- Probes nearby/common Tor control ports if the configured control port is unavailable.
 - Builds controller-owned Tor circuits.
 - Keeps the configured number of circuits available.
 - Rebuilds a circuit if Tor reports it as closed or failed.
 - Runs periodic keep-alive requests on idle circuits.
+- Auto-selects a reachable SOCKS port using Tor listener info when the configured SOCKS port is unreachable.
 - Lets the user press a circuit number and enter a download URL.
 - Streams downloads through the selected circuit using Tor SOCKS credentials and stream attachment.
 - Shows download progress in place without extra scrolling lines.
 - Saves completed downloads to the configured output directory.
+
+## Architecture
+
+### Component view
+
+```mermaid
+flowchart LR
+  U[User Keyboard Input] --> TUI["Curses TUI (main loop)"]
+  TUI --> APP["TorCircuitCollectorApp\n(slot state + scheduler)"]
+
+  APP --> CTRL["Stem Controller\n(ControlPort)"]
+  CTRL --> TOR["Tor daemon"]
+
+  APP --> DL["Download worker threads"]
+  DL --> SOCKS["SOCKS sessions\n(username/password isolate)"]
+  SOCKS --> TOR
+  TOR --> INTERNET["Target URLs / Keepalive URL"]
+
+  APP --> FS["downloads/ output"]
+  APP --> CLIP["Clipboard tools\n(wl-copy/xclip/xsel)"]
+  DL --> HIST["Session output + history"]
+  HIST --> TUI
+```
+
+### Download flow
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant UI as Curses UI
+  participant App as Collector App
+  participant Ctrl as Stem Controller
+  participant Tor as Tor Daemon
+  participant Worker as Download Worker
+  participant Net as Remote URL
+
+  User->>UI: Press circuit digit
+  UI->>App: Select slot
+  User->>UI: Enter URL + Enter
+  UI->>App: start_download(slot, url)
+
+  App->>Ctrl: Attach stream listener for slot circuit
+  App->>Worker: Spawn download worker
+  Worker->>Tor: Open SOCKS connection (isolated auth)
+  Tor->>Net: HTTP(S) request via selected circuit
+  Net-->>Tor: Response chunks
+  Tor-->>Worker: Stream bytes
+  Worker-->>App: Progress, status, session output
+  App-->>UI: Refresh table + lower panels
+
+  alt User presses t in session viewer
+    User->>UI: Terminate
+    UI->>App: terminate_slot_download(slot)
+    App->>Worker: cancel_requested = true
+    Worker-->>App: stop and finalize state
+  end
+
+  Worker-->>App: DONE or ERR
+  App-->>UI: Final status shown
+```
 
 ## Requirements
 
@@ -92,13 +154,106 @@ You can also place a symlink to `tor-circuit-collector.sh` somewhere on your `PA
 
 Once running:
 
-- Press `1` through `5` to select a circuit.
+### Key Cheat Sheet
+
+| Key | Context | Action |
+|---|---|---|
+| `1`..`9` | Main screen | Select circuit. If actively downloading, opens session viewer. Otherwise opens URL prompt for that circuit. |
+| `R` / `r` | Main screen | Retry failed download(s). If exactly one failed circuit exists, retries immediately. If multiple exist, opens retry selector. |
+| `N` / `n` | Main screen | Open replace selector. Press circuit digit to replace that circuit with a newly built one immediately. |
+| `X` / `x` | Main screen | Open clear selector. Press circuit digit to clear that slot state to ready without rebuilding. |
+| `C` / `c` | Main screen | Open copy selector. Press circuit digit to copy that slot URL to clipboard immediately. |
+| `P` / `p` | Main screen | Read URL from clipboard and start it on the next available circuit. |
+| `H` / `h` | Main screen | Open successful download history (most recent first). |
+| `F` / `f` | Main screen | Open failed download history (excluding URLs that later succeeded). |
+| `q` | Main screen | Quit application. |
+| Digit (`1`..`9`) | Retry selector | Retry that circuit immediately (no Enter). |
+| Digit (`1`..`9`) | Replace selector | Replace that circuit immediately (no Enter). Active transfer is interrupted first. |
+| Digit (`1`..`9`) | Clear selector | Clear that circuit slot state to ready immediately (no Enter). |
+| Digit (`1`..`9`) | Copy selector | Copy that circuit URL immediately (no Enter). |
+| `Esc` | Any selector/prompt | Cancel current selector/prompt. |
+| `Enter` | URL prompt | Submit URL for selected circuit. |
+| `c` | Session viewer | Continue (close viewer). |
+| `t` | Session viewer | Terminate active download for viewed circuit. |
+| `Up` / `Down` or `k` / `j` | Session viewer | Scroll output. |
+| `PageUp` / `PageDown` | Session viewer | Scroll faster. |
+| `Up` / `Down` or `k` / `j` | Success/Failed history viewer | Scroll history. |
+| `PageUp` / `PageDown` | Success/Failed history viewer | Scroll history faster. |
+| `c` / `C` | Success/Failed history viewer | Clear the currently displayed history list. |
+| `h` or `Esc` | Success history viewer | Close success history viewer. |
+| `f` or `Esc` | Failed history viewer | Close failed history viewer. |
+
+### Common Workflows
+
+Recover a failed download quickly:
+
+1. Press `R`.
+2. If only one failed circuit exists, retry starts immediately.
+3. If a selector appears, press the failed circuit digit to retry immediately.
+
+Replace a circuit that looks unhealthy:
+
+1. Press `N`.
+2. Press the circuit digit.
+3. The app interrupts any active transfer on that slot, then builds a fresh circuit.
+
+Clear a slot to ready without rebuilding:
+
+1. Press `X`.
+2. Press the circuit digit.
+3. The app interrupts any active transfer, clears slot-local transfer/error state, and returns the slot to `ready`.
+
+Start next URL from clipboard:
+
+1. Copy a full `http://` or `https://` URL to your system clipboard.
+2. Press `P`.
+3. The app selects the next available circuit and starts the download immediately.
+
+### Detailed Notes
+
+No Enter needed for these actions:
+
+- Pressing a circuit digit on the main screen acts immediately.
+- Retry selector (`R`) uses immediate digit selection.
+- Replace selector (`N`) uses immediate digit selection.
+- Clear selector (`X`) uses immediate digit selection.
+- Copy selector (`C`) uses immediate digit selection.
+
+- Press `1` through the configured circuit count (up to `9`) to select a circuit.
+- If a circuit is actively downloading, pressing its number opens the lower-half session output viewer.
+- In the session output viewer, press `c` to continue (close viewer) or `t` to terminate the active download.
+- Press `R` to retry failed downloads.
+- If exactly one failed circuit exists, `R` retries it immediately.
+- If multiple failed circuits exist, `R` opens a retry prompt; press the circuit digit to retry immediately.
+- Press `C` to open a copy prompt; press the circuit digit to copy that slot URL to clipboard immediately (no Enter).
+- `C` copy works even when a transfer is active or failed, as long as that slot has a URL.
+- Press `N` to open a replace prompt; press the circuit digit to replace that slot with a newly built circuit immediately (no Enter).
+- `N` replace interrupts an active download on that circuit before rebuilding.
+- Press `X` to open a clear prompt; press the circuit digit to clear that slot state to ready without rebuilding.
+- `X` clear interrupts an active download on that circuit.
+- `X` clear also removes stale transfer/error state for that slot (download summary, URL, byte counter, and slot-local output).
+- Press `P` to paste the clipboard URL into the next available circuit and start immediately.
+- Press `H` to open a scrollable successful-download history pane, with most recent entries at the top.
+- Press `F` to open a scrollable failed-download history pane.
+- Failed history excludes any URL that later succeeded.
+- Press `C` or `c` while viewing success history or failed history to clear that list.
+- Optional terminal-dependent shortcuts: `Ctrl+<number>` retries a failed URL for that circuit, and `Alt+<number>` opens that circuit URL prompt prefilled from clipboard.
 - Enter an absolute `http://` or `https://` URL.
 - Press `Enter` to start the download.
 - Press `Esc` while entering a URL to cancel the prompt.
 - Press `q` to quit.
 
 The UI shows each circuit's current Tor circuit ID, exit relay, age, keep-alive status, failure count, and download progress.
+
+Status display and colors:
+
+- `ready` is shown in green.
+- `downloading` is shown in cyan.
+- `keep-alive` is shown in blue.
+- Build/rebuild/queued/terminating states are shown in yellow.
+- Failed/dropped/error states are shown in red.
+- `ERR ...` in the Download column is shown in red and means the most recent attempt failed.
+- A circuit may have downloaded some bytes before an `ERR` if the failure happened mid-transfer.
 
 ## Configuration
 
@@ -132,12 +287,16 @@ Command-line flags override JSON values.
   "tor": {
     "socks_host": "127.0.0.1",
     "socks_port": 9050,
+    "socks_port_candidates": [9150],
     "control_host": "127.0.0.1",
     "control_port": 9051,
+    "control_port_candidates": [9151],
+    "control_port_scan_radius": 10,
+    "port_probe_timeout": 0.6,
     "control_password": null
   },
   "collector": {
-    "circuits": 5,
+    "circuits": 9,
     "keepalive_url": "https://check.torproject.org/api/ip",
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
@@ -192,7 +351,18 @@ Common options:
 ./tor-circuit-collector.sh --circuits 5
 ./tor-circuit-collector.sh --show-paths
 ./tor-circuit-collector.sh --keep-partials
+./tor-circuit-collector.sh --control-port-candidates 9151,39051
+./tor-circuit-collector.sh --socks-port-candidates 9150,39050
+./tor-circuit-collector.sh --control-port-scan-radius 20
+./tor-circuit-collector.sh --port-probe-timeout 1.0
 ```
+
+Port discovery tuning:
+
+- `tor.control_port_candidates`: additional control ports to try first.
+- `tor.control_port_scan_radius`: probes `control_port +/- N`.
+- `tor.socks_port_candidates`: additional SOCKS ports to probe.
+- `tor.port_probe_timeout`: TCP probe timeout in seconds for port checks.
 
 Boolean options support both positive and negative forms:
 
@@ -221,6 +391,18 @@ Downloads are streamed in chunks and written first to a `.part` file. When a dow
 
 If the server provides a `Content-Disposition` filename, that name is used. Otherwise, the filename is inferred from the URL path. Existing filenames are not overwritten; the script appends `-1`, `-2`, and so on.
 
+Filename post-processing is applied before writing files:
+
+- Names are normalized (unsafe path/control characters removed, whitespace collapsed).
+- Very long names are shortened to keep them manageable while preserving the file extension.
+- If the filename has no extension (or only `.bin`), the app tries to infer one from HTTP `Content-Type` (for example `.pdf` or `.epub`).
+
+History persistence:
+
+- Successful download history is persisted in the script directory as `tor-circuit-collector.success-history.jsonl`.
+- Failed download history is persisted in the script directory as `tor-circuit-collector.failed-history.jsonl`.
+- Failed history is cross-checked against successful URLs so entries are hidden/removed once that URL eventually succeeds.
+
 By default, failed partial downloads are removed. To keep them:
 
 ```bash
@@ -243,6 +425,8 @@ or set:
 
 Check that Tor is running and that `ControlPort` is enabled.
 
+The collector now probes a small set of likely control ports automatically (the configured port, nearby ports, and common Tor defaults) before failing.
+
 Example checks:
 
 ```bash
@@ -262,7 +446,19 @@ python3 -m pip install stem "requests[socks]"
 
 ### Terminal too small
 
-Use a terminal window at least 80 columns wide and 12 rows high.
+Use a terminal window at least 80 columns wide and 13 rows high.
+
+### Clipboard operations with `C` or `P` do not work
+
+Install one of these clipboard tools so the app can read/write clipboard text:
+
+```bash
+sudo apt install wl-clipboard
+# or
+sudo apt install xclip
+# or
+sudo apt install xsel
+```
 
 ### Downloads fail but circuits stay alive
 

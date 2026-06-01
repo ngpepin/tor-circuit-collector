@@ -2,7 +2,7 @@
 """
 tor-circuit-collector.py
 
-Maintain five controller-built Tor circuits, keep them warm with periodic
+Maintain nine controller-built Tor circuits, keep them warm with periodic
 keep-alive requests, and let the user pick a numbered circuit for a streamed
 HTTP(S) download. The terminal UI redraws in place using curses.
 
@@ -25,10 +25,14 @@ from __future__ import annotations
 import argparse
 import curses
 import json
+import mimetypes
 import os
 import random
 import re
+import shutil
+import socket
 import signal
+import subprocess
 import string
 import sys
 import threading
@@ -75,6 +79,21 @@ def ensure_dependencies() -> None:
 HTTP_CHUNK_SIZE = 256 * 1024
 DEFAULT_KEEPALIVE_URL = "https://check.torproject.org/api/ip"
 USER_AGENT = "tor-circuit-collector/1.0"
+COMMON_CONTROL_PORTS = (9051, 9151)
+COMMON_SOCKS_PORTS = (9050, 9150)
+DEFAULT_FILENAME_MAX_LENGTH = 120
+
+CONTENT_TYPE_EXTENSION_HINTS = {
+    "application/pdf": ".pdf",
+    "application/epub+zip": ".epub",
+    "application/x-mobipocket-ebook": ".mobi",
+    "application/zip": ".zip",
+    "application/json": ".json",
+    "application/xml": ".xml",
+    "text/xml": ".xml",
+    "text/html": ".html",
+    "text/plain": ".txt",
+}
 
 
 @dataclass
@@ -127,6 +146,13 @@ class RelayCandidate:
         return f"${self.fingerprint}"
 
 
+@dataclass(frozen=True)
+class KeyEvent:
+    key: int
+    alt: bool = False
+    ctrl: bool = False
+
+
 class TorCircuitCollector:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -137,6 +163,10 @@ class TorCircuitCollector:
         self.lock = threading.RLock()
         self.control_lock = threading.RLock()
         self.message = "Starting Tor circuit collector..."
+        self.selected_control_port: Optional[int] = int(args.control_port)
+        self.selected_socks_port: Optional[int] = int(args.socks_port)
+        self.port_discovery_note = "initial"
+        self.port_discovery_line = self._build_port_discovery_line()
 
         self.controller: Optional[Controller] = None
         self.original_leave_streams_unattached: Optional[str] = None
@@ -149,6 +179,20 @@ class TorCircuitCollector:
         }
         self.threads: List[threading.Thread] = []
         self.reserved_exit_fingerprints: Set[str] = set()
+        self.download_history: List[str] = []
+        self.failed_download_history: List[str] = []
+        self.success_history_records: List[Dict[str, object]] = []
+        self.failed_history_records: List[Dict[str, object]] = []
+        self.successful_urls: Set[str] = set()
+        self.history_limit = 2000
+
+        try:
+            self.script_dir = Path(__file__).resolve().parent
+        except NameError:
+            self.script_dir = Path.cwd()
+        self.success_history_file = self.script_dir / "tor-circuit-collector.success-history.jsonl"
+        self.failed_history_file = self.script_dir / "tor-circuit-collector.failed-history.jsonl"
+        self.load_persistent_histories()
 
         # Build a couple of circuits at a time, but never hold control_lock
         # while waiting for circuit construction. Stream attachment must stay
@@ -176,7 +220,208 @@ class TorCircuitCollector:
             if len(slot.session_output) > 1000:
                 slot.session_output = slot.session_output[-1000:]
 
+    def append_download_history(self, slot_index: int, url: str, filename: str, bytes_done: int) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        normalized_url = self.normalize_history_url(url)
+        entry = {
+            "timestamp": timestamp,
+            "slot": int(slot_index),
+            "url": url,
+            "url_norm": normalized_url,
+            "filename": filename,
+            "bytes_done": int(bytes_done),
+        }
+
+        removed_failed = False
+        failed_snapshot: Optional[List[Dict[str, object]]] = None
+        with self.lock:
+            self.success_history_records.insert(0, entry)
+            if len(self.success_history_records) > self.history_limit:
+                self.success_history_records = self.success_history_records[: self.history_limit]
+
+            self.successful_urls.add(normalized_url)
+            before = len(self.failed_history_records)
+            self.failed_history_records = [
+                rec for rec in self.failed_history_records if str(rec.get("url_norm", "")) != normalized_url
+            ]
+            removed_failed = len(self.failed_history_records) != before
+            if removed_failed:
+                failed_snapshot = list(self.failed_history_records)
+
+            self.rebuild_history_views_locked()
+
+        self.append_history_file_entry(self.success_history_file, entry)
+        if removed_failed and failed_snapshot is not None:
+            self.rewrite_history_file(self.failed_history_file, list(reversed(failed_snapshot)))
+
+    def append_failed_download_history(
+        self,
+        slot_index: int,
+        url: str,
+        filename: str,
+        bytes_done: int,
+        error: str,
+    ) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        normalized_url = self.normalize_history_url(url)
+        entry = {
+            "timestamp": timestamp,
+            "slot": int(slot_index),
+            "url": url,
+            "url_norm": normalized_url,
+            "filename": filename,
+            "bytes_done": int(bytes_done),
+            "error": error,
+        }
+
+        should_persist = True
+        with self.lock:
+            # Do not show/persist failures for URLs that already eventually succeeded.
+            if normalized_url in self.successful_urls:
+                should_persist = False
+            else:
+                self.failed_history_records.insert(0, entry)
+                if len(self.failed_history_records) > self.history_limit:
+                    self.failed_history_records = self.failed_history_records[: self.history_limit]
+                self.rebuild_history_views_locked()
+
+        if should_persist:
+            self.append_history_file_entry(self.failed_history_file, entry)
+
+    def clear_success_history(self) -> None:
+        with self.lock:
+            self.success_history_records = []
+            self.download_history = []
+            self.successful_urls = set()
+            self.rebuild_history_views_locked()
+        self.rewrite_history_file(self.success_history_file, [])
+
+    def clear_failed_history(self) -> None:
+        with self.lock:
+            self.failed_history_records = []
+            self.failed_download_history = []
+        self.rewrite_history_file(self.failed_history_file, [])
+
+    @staticmethod
+    def normalize_history_url(url: str) -> str:
+        return url.strip()
+
+    @staticmethod
+    def build_history_line(entry: Dict[str, object], failed: bool) -> str:
+        timestamp = str(entry.get("timestamp", ""))
+        slot = int(entry.get("slot", 0) or 0)
+        filename = str(entry.get("filename", "download.bin"))
+        bytes_done = int(entry.get("bytes_done", 0) or 0)
+        url = str(entry.get("url", ""))
+        line = f"[{timestamp}] circuit {slot}: {filename} ({human_bytes(bytes_done)}) <- {url}"
+        if failed:
+            error = str(entry.get("error", ""))
+            if error:
+                line += f" | ERR {error}"
+        return line
+
+    def rebuild_history_views_locked(self) -> None:
+        self.download_history = [self.build_history_line(rec, failed=False) for rec in self.success_history_records]
+        self.failed_download_history = [
+            self.build_history_line(rec, failed=True)
+            for rec in self.failed_history_records
+            if str(rec.get("url_norm", "")) not in self.successful_urls
+        ]
+
+    @staticmethod
+    def load_history_file(path: Path) -> List[Dict[str, object]]:
+        if not path.exists():
+            return []
+
+        records: List[Dict[str, object]] = []
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        raw = json.loads(text)
+                    except Exception:
+                        continue
+                    if isinstance(raw, dict):
+                        records.append(raw)
+        except OSError:
+            return []
+        return records
+
+    @staticmethod
+    def append_history_file_entry(path: Path, entry: Dict[str, object]) -> None:
+        try:
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def rewrite_history_file(path: Path, entries: List[Dict[str, object]]) -> None:
+        try:
+            with path.open("w", encoding="utf-8") as fh:
+                for entry in entries:
+                    fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except OSError:
+            pass
+
+    def load_persistent_histories(self) -> None:
+        success_raw = self.load_history_file(self.success_history_file)
+        failed_raw = self.load_history_file(self.failed_history_file)
+
+        success_records: List[Dict[str, object]] = []
+        for raw in success_raw:
+            url = str(raw.get("url", "")).strip()
+            if not url:
+                continue
+            normalized_url = self.normalize_history_url(url)
+            success_records.append(
+                {
+                    "timestamp": str(raw.get("timestamp", "")) or time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "slot": int(raw.get("slot", 0) or 0),
+                    "url": url,
+                    "url_norm": normalized_url,
+                    "filename": str(raw.get("filename", "download.bin")),
+                    "bytes_done": int(raw.get("bytes_done", 0) or 0),
+                }
+            )
+
+        failed_records: List[Dict[str, object]] = []
+        for raw in failed_raw:
+            url = str(raw.get("url", "")).strip()
+            if not url:
+                continue
+            normalized_url = self.normalize_history_url(url)
+            failed_records.append(
+                {
+                    "timestamp": str(raw.get("timestamp", "")) or time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "slot": int(raw.get("slot", 0) or 0),
+                    "url": url,
+                    "url_norm": normalized_url,
+                    "filename": str(raw.get("filename", "download.bin")),
+                    "bytes_done": int(raw.get("bytes_done", 0) or 0),
+                    "error": str(raw.get("error", "")),
+                }
+            )
+
+        # Files are append-only chronological logs; convert to newest-first in memory.
+        success_newest_first = list(reversed(success_records))[: self.history_limit]
+        successful_urls = {str(rec.get("url_norm", "")) for rec in success_newest_first}
+        failed_newest_first = [
+            rec for rec in reversed(failed_records)
+            if str(rec.get("url_norm", "")) not in successful_urls
+        ][: self.history_limit]
+
+        with self.lock:
+            self.success_history_records = success_newest_first
+            self.failed_history_records = failed_newest_first
+            self.successful_urls = successful_urls
+            self.rebuild_history_views_locked()
+
     def terminate_slot_download(self, slot_index: int) -> bool:
+        session_to_close = None
         with self.lock:
             slot = self.slots[slot_index - 1]
             state = slot.download
@@ -184,9 +429,28 @@ class TorCircuitCollector:
                 return False
             state.cancel_requested = True
             slot.status = "terminating"
+            session_to_close = self.sessions.pop(slot_index, None)
+        if session_to_close is not None:
+            try:
+                session_to_close.close()
+            except Exception:
+                pass
         self.append_slot_output(slot_index, "Terminate requested by user.")
         self.set_message(f"Terminate requested for circuit {slot_index} download.")
         return True
+
+    def clear_slot_state(self, slot_index: int) -> bool:
+        interrupted = self.terminate_slot_download(slot_index)
+        with self.lock:
+            slot = self.slots[slot_index - 1]
+            slot.download = None
+            slot.bytes_since_last_url = 0
+            slot.last_url = ""
+            slot.last_error = ""
+            slot.session_output = []
+            slot.status = "ready"
+            slot.consecutive_keepalive_failures = 0
+        return interrupted
 
     def start(self) -> None:
         self.connect_controller()
@@ -194,10 +458,179 @@ class TorCircuitCollector:
         monitor.start()
         self.threads.append(monitor)
 
-    def connect_controller(self) -> None:
+    @staticmethod
+    def _unique_ports(ports: List[int]) -> List[int]:
+        result: List[int] = []
+        seen: Set[int] = set()
+        for port in ports:
+            if 1 <= int(port) <= 65535 and int(port) not in seen:
+                seen.add(int(port))
+                result.append(int(port))
+        return result
+
+    @staticmethod
+    def _extract_port_from_listener_token(token: str) -> Optional[int]:
+        candidate = token.strip()
+        if not candidate:
+            return None
+        if candidate.startswith("[") and "]:" in candidate:
+            _, _, tail = candidate.rpartition("]:")
+            return int(tail) if tail.isdigit() else None
+        if ":" in candidate:
+            _, _, tail = candidate.rpartition(":")
+            return int(tail) if tail.isdigit() else None
+        return int(candidate) if candidate.isdigit() else None
+
+    @classmethod
+    def _parse_listener_ports(cls, raw_listeners: str) -> List[int]:
+        if not raw_listeners:
+            return []
+        tokens = re.findall(r'"([^"]+)"', raw_listeners)
+        if not tokens:
+            tokens = raw_listeners.split()
+        ports: List[int] = []
+        for token in tokens:
+            parsed = cls._extract_port_from_listener_token(token)
+            if parsed is not None:
+                ports.append(parsed)
+        return cls._unique_ports(ports)
+
+    @staticmethod
+    def _tcp_connectable(host: str, port: int, timeout: float = 0.6) -> bool:
         try:
-            controller = Controller.from_port(address=self.args.control_host, port=self.args.control_port)
-            controller.authenticate(password=self.args.control_password)
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _coerce_port_list(cls, raw_ports: object) -> List[int]:
+        if raw_ports is None:
+            return []
+
+        values: List[object]
+        if isinstance(raw_ports, str):
+            values = [item for item in re.split(r"[,\s]+", raw_ports.strip()) if item]
+        elif isinstance(raw_ports, (list, tuple, set)):
+            values = list(raw_ports)
+        else:
+            values = [raw_ports]
+
+        ports: List[int] = []
+        for value in values:
+            try:
+                ports.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return cls._unique_ports(ports)
+
+    def _port_probe_timeout(self) -> float:
+        try:
+            timeout = float(self.args.port_probe_timeout)
+        except (TypeError, ValueError):
+            return 0.6
+        return max(0.05, min(5.0, timeout))
+
+    def _build_port_discovery_line(self) -> str:
+        control_candidates = self._coerce_port_list(getattr(self.args, "control_port_candidates", []))
+        socks_candidates = self._coerce_port_list(getattr(self.args, "socks_port_candidates", []))
+        scan_radius = max(0, int(getattr(self.args, "control_port_scan_radius", 10) or 0))
+        timeout = self._port_probe_timeout()
+        active_control = self.selected_control_port if self.selected_control_port is not None else int(self.args.control_port)
+        active_socks = self.selected_socks_port if self.selected_socks_port is not None else int(self.args.socks_port)
+
+        control_text = ",".join(str(port) for port in control_candidates) if control_candidates else "-"
+        socks_text = ",".join(str(port) for port in socks_candidates) if socks_candidates else "-"
+        return (
+            "Port discovery | "
+            f"control active={active_control} base={self.args.control_port} candidates=[{control_text}] radius={scan_radius} | "
+            f"socks active={active_socks} base={self.args.socks_port} candidates=[{socks_text}] | "
+            f"probe_timeout={timeout:.2f}s | {self.port_discovery_note}"
+        )
+
+    def _refresh_port_discovery_line(self, note: Optional[str] = None) -> None:
+        if note is not None:
+            self.port_discovery_note = note
+        self.port_discovery_line = self._build_port_discovery_line()
+
+    def _candidate_control_ports(self) -> List[int]:
+        base = int(self.args.control_port)
+        configured = self._coerce_port_list(getattr(self.args, "control_port_candidates", []))
+        candidates: List[int] = [base, *configured]
+        scan_radius = max(0, int(getattr(self.args, "control_port_scan_radius", 10) or 0))
+
+        # Probe near the requested control port first, then common Tor ports.
+        for delta in range(1, scan_radius + 1):
+            candidates.append(base + delta)
+            candidates.append(base - delta)
+        candidates.extend(list(COMMON_CONTROL_PORTS))
+        return self._unique_ports(candidates)
+
+    def _auto_select_socks_port(self, controller) -> None:
+        configured_port = int(self.args.socks_port)
+        probe_timeout = self._port_probe_timeout()
+        if self._tcp_connectable(self.args.socks_host, configured_port, timeout=probe_timeout):
+            self.selected_socks_port = configured_port
+            self._refresh_port_discovery_line(f"using configured socks {configured_port}")
+            return
+
+        listener_ports: List[int] = []
+        try:
+            raw = controller.get_info("net/listeners/socks", "")
+            listener_ports = self._parse_listener_ports(raw)
+        except Exception:
+            listener_ports = []
+
+        configured = self._coerce_port_list(getattr(self.args, "socks_port_candidates", []))
+        candidates = self._unique_ports([configured_port, *configured, *listener_ports, *COMMON_SOCKS_PORTS])
+        for port in candidates:
+            if self._tcp_connectable(self.args.socks_host, port, timeout=probe_timeout):
+                self.args.socks_port = port
+                self.selected_socks_port = port
+                if port != configured_port:
+                    self._refresh_port_discovery_line(f"discovered socks {port}")
+                    self.set_message(
+                        f"Configured SOCKS port {configured_port} unreachable; using discovered port {port}."
+                    )
+                else:
+                    self._refresh_port_discovery_line(f"using configured socks {port}")
+                return
+
+        self.selected_socks_port = configured_port
+        self._refresh_port_discovery_line("no reachable socks discovered")
+        self.set_message(
+            f"Warning: no reachable SOCKS port found on {self.args.socks_host}; keeping configured {configured_port}."
+        )
+
+    def connect_controller(self) -> None:
+        controller = None
+        tried_ports: List[int] = []
+        connect_errors: List[str] = []
+        selected_control_port: Optional[int] = None
+
+        for port in self._candidate_control_ports():
+            tried_ports.append(port)
+            try:
+                candidate = Controller.from_port(address=self.args.control_host, port=port)
+                candidate.authenticate(password=self.args.control_password)
+                controller = candidate
+                selected_control_port = port
+                break
+            except Exception as exc:
+                connect_errors.append(f"{port}: {self._short_error(exc)}")
+
+        if controller is None:
+            detail = "; ".join(connect_errors[:6])
+            raise RuntimeError(
+                "Could not connect/authenticate to Tor ControlPort. Ensure Tor is running with "
+                "ControlPort enabled and use --control-password if needed. "
+                f"Tried ports {tried_ports}. Errors: {detail}"
+            )
+
+        self.args.control_port = selected_control_port
+        self.selected_control_port = selected_control_port
+        self._refresh_port_discovery_line(f"selected control {selected_control_port}")
+        try:
             with self.control_lock:
                 try:
                     current = controller.get_conf("__LeaveStreamsUnattached", None)
@@ -219,6 +652,7 @@ class TorCircuitCollector:
             self.set_message(
                 f"Connected to Tor control port {self.args.control_host}:{self.args.control_port}. Building circuits..."
             )
+            self._auto_select_socks_port(controller)
         except Exception as exc:
             raise RuntimeError(
                 "Could not connect/authenticate to Tor ControlPort. Ensure Tor is running with "
@@ -323,6 +757,10 @@ class TorCircuitCollector:
             slot.exit_ip = ""
             slot.path_summary = ""
             slot.created_at = None
+            # Reset slot transfer/error state so a newly built circuit starts clean.
+            slot.download = None
+            slot.bytes_since_last_url = 0
+            slot.last_url = ""
 
         if old_circuit and self.controller is not None:
             try:
@@ -409,6 +847,9 @@ class TorCircuitCollector:
                 slot.rebuilding = False
                 slot.consecutive_keepalive_failures = 0
                 slot.last_error = ""
+                slot.download = None
+                slot.bytes_since_last_url = 0
+                slot.last_url = ""
 
                 # Do not immediately launch a keep-alive on a just-built circuit.
                 # It can race with the remaining initial circuit builds and makes
@@ -673,25 +1114,50 @@ class TorCircuitCollector:
                     raise
 
             with self.lock:
-                slot.status = "ready"
                 slot.last_ok_at = time.monotonic()
-                slot.last_error = ""
                 slot.consecutive_keepalive_failures = 0
+                active_download = slot.download is not None and not slot.download.done and not slot.download.error
+                failed_download = slot.download is not None and bool(slot.download.error)
+                if active_download:
+                    slot.status = "downloading"
+                elif failed_download:
+                    slot.status = "download failed"
+                else:
+                    slot.status = "ready"
+                    slot.last_error = ""
         except Exception as exc:
             rebuild = False
             with self.lock:
-                slot.last_error = self._short_error(exc)
+                keepalive_error = self._short_error(exc)
                 slot.consecutive_keepalive_failures += 1
                 rebuild = slot.consecutive_keepalive_failures >= self.args.max_keepalive_failures
-                slot.status = "rebuilding" if rebuild else "ready"
-            self.set_message(f"Circuit {slot.index} keep-alive failed: {self._short_error(exc)}")
+                active_download = slot.download is not None and not slot.download.done and not slot.download.error
+                failed_download = slot.download is not None and bool(slot.download.error)
+                if rebuild:
+                    slot.status = "rebuilding"
+                    slot.last_error = keepalive_error
+                elif active_download:
+                    slot.status = "downloading"
+                elif failed_download:
+                    slot.status = "download failed"
+                else:
+                    slot.status = "ready"
+                    slot.last_error = keepalive_error
+            self.set_message(f"Circuit {slot.index} keep-alive failed: {keepalive_error}")
             if rebuild:
                 self.replace_circuit(slot_index, "keep-alive failures")
         finally:
             with self.lock:
                 slot.keepalive_active = False
                 if slot.circuit_id and slot.status == "keep-alive":
-                    slot.status = "ready"
+                    active_download = slot.download is not None and not slot.download.done and not slot.download.error
+                    failed_download = slot.download is not None and bool(slot.download.error)
+                    if active_download:
+                        slot.status = "downloading"
+                    elif failed_download:
+                        slot.status = "download failed"
+                    else:
+                        slot.status = "ready"
 
     def start_download(self, slot_index: int, url: str) -> None:
         url = url.strip()
@@ -704,6 +1170,7 @@ class TorCircuitCollector:
             return
 
         slot = self.slots[slot_index - 1]
+        guessed_name = self.filename_from_url(url)
         with self.lock:
             active = slot.download is not None and not slot.download.done and not slot.download.error
             if active:
@@ -715,7 +1182,9 @@ class TorCircuitCollector:
             slot.bytes_since_last_url = 0
             slot.last_url = url
             slot.session_output = []
-            slot.download = None
+            slot.download = DownloadState(url=url, filename=guessed_name)
+            slot.status = "downloading"
+            slot.last_error = ""
 
         self.append_slot_output(slot_index, f"URL submitted: {url}")
 
@@ -728,9 +1197,11 @@ class TorCircuitCollector:
     def download_worker(self, slot_index: int, url: str) -> None:
         slot = self.slots[slot_index - 1]
         guessed_name = self.filename_from_url(url)
-        state = DownloadState(url=url, filename=guessed_name)
         with self.lock:
-            slot.download = state
+            state = slot.download
+            if state is None or state.url != url or state.done or state.error:
+                state = DownloadState(url=url, filename=guessed_name)
+                slot.download = state
             slot.status = "downloading"
             slot.last_error = ""
 
@@ -783,10 +1254,17 @@ class TorCircuitCollector:
                     os.replace(part_path, final_path)
 
             with self.lock:
-                state.done = True
-                slot.status = "ready"
-                slot.last_ok_at = time.monotonic()
-                slot.last_error = ""
+                if slot.download is state:
+                    state.done = True
+                    slot.status = "ready"
+                    slot.last_ok_at = time.monotonic()
+                    slot.last_error = ""
+            self.append_download_history(
+                slot_index,
+                state.url,
+                final_path.name if final_path else state.filename,
+                state.bytes_done,
+            )
             self.append_slot_output(
                 slot_index,
                 f"Download complete: {final_path.name if final_path else state.filename} ({human_bytes(state.bytes_done)}).",
@@ -800,8 +1278,16 @@ class TorCircuitCollector:
                     pass
             with self.lock:
                 state.error = self._short_error(exc)
-                slot.status = "download failed"
-                slot.last_error = state.error
+                if slot.download is state:
+                    slot.status = "download failed"
+                    slot.last_error = state.error
+            self.append_failed_download_history(
+                slot_index,
+                state.url,
+                final_path.name if final_path else state.filename,
+                state.bytes_done,
+                state.error,
+            )
             self.append_slot_output(slot_index, f"Download failed: {state.error}")
             self.set_message(f"Circuit {slot_index} download failed: {state.error}")
 
@@ -811,14 +1297,41 @@ class TorCircuitCollector:
         return sanitize_filename(path_name or "download.bin")
 
     def filename_from_response(self, url: str, headers, fallback: str) -> str:
+        candidate = fallback or self.filename_from_url(url)
         disposition = headers.get("Content-Disposition", "")
         if disposition:
             msg = Message()
             msg["Content-Disposition"] = disposition
             filename = msg.get_filename()
             if filename:
-                return sanitize_filename(filename)
-        return sanitize_filename(fallback or self.filename_from_url(url))
+                candidate = filename
+
+        normalized = sanitize_filename(candidate)
+        content_type = headers.get("Content-Type", "")
+        extension_hint = self.extension_from_content_type(content_type)
+        if extension_hint:
+            name_path = Path(normalized)
+            current_suffix = name_path.suffix.lower()
+            if not current_suffix:
+                normalized = sanitize_filename(f"{normalized}{extension_hint}")
+            elif current_suffix == ".bin" and extension_hint != ".bin":
+                normalized = sanitize_filename(f"{name_path.stem}{extension_hint}")
+        return normalized
+
+    @staticmethod
+    def extension_from_content_type(content_type: str) -> Optional[str]:
+        mime = content_type.split(";", 1)[0].strip().lower()
+        if not mime:
+            return None
+
+        extension = CONTENT_TYPE_EXTENSION_HINTS.get(mime)
+        if extension is None:
+            extension = mimetypes.guess_extension(mime, strict=False)
+        if extension == ".jpe":
+            extension = ".jpg"
+        if extension and not extension.startswith("."):
+            extension = f".{extension}"
+        return extension
 
     @staticmethod
     def unique_path(path: Path) -> Path:
@@ -844,10 +1357,33 @@ class TorCircuitCollector:
 def sanitize_filename(name: str) -> str:
     name = name.strip().replace("/", "_").replace("\\", "_")
     name = re.sub(r"[\x00-\x1f\x7f]+", "_", name)
+    name = re.sub(r"[<>:\"|?*]+", "_", name)
     name = re.sub(r"\s+", " ", name)
     if name in {"", ".", ".."}:
         return "download.bin"
-    return name[:180]
+
+    path_name = Path(name)
+    suffixes = path_name.suffixes
+    if len(suffixes) >= 2 and suffixes[-1].lower() in {".gz", ".bz2", ".xz", ".zst"}:
+        suffix = "".join(suffixes[-2:])
+        stem = path_name.name[: -len(suffix)]
+    else:
+        suffix = path_name.suffix
+        stem = path_name.stem if suffix else path_name.name
+
+    stem = stem.strip(" .") or "download"
+    max_length = DEFAULT_FILENAME_MAX_LENGTH
+    stem_budget = max(1, max_length - len(suffix))
+    if len(stem) > stem_budget:
+        if stem_budget > 3:
+            stem = stem[: stem_budget - 3].rstrip(" ._-") + "..."
+        else:
+            stem = stem[:stem_budget]
+
+    candidate = f"{stem}{suffix}"
+    if candidate in {"", ".", ".."}:
+        return "download.bin"
+    return candidate
 
 
 def human_bytes(value: Optional[int]) -> str:
@@ -913,18 +1449,284 @@ def add_line(stdscr, row: int, text: str, attr: int = 0) -> None:
         stdscr.addnstr(row, 0, text.ljust(max(0, width - 1)), max(0, width - 1), attr)
 
 
+UI_COLOR_ATTRS: Dict[str, int] = {}
+
+
+def init_ui_colors() -> None:
+    global UI_COLOR_ATTRS
+    UI_COLOR_ATTRS = {}
+
+    try:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+
+        palette = [
+            ("ok", curses.COLOR_GREEN),
+            ("warn", curses.COLOR_YELLOW),
+            ("error", curses.COLOR_RED),
+            ("info", curses.COLOR_CYAN),
+            ("idle", curses.COLOR_BLUE),
+        ]
+        pair_index = 1
+        for name, fg in palette:
+            try:
+                curses.init_pair(pair_index, fg, -1)
+                UI_COLOR_ATTRS[name] = curses.color_pair(pair_index)
+            except curses.error:
+                UI_COLOR_ATTRS[name] = 0
+            pair_index += 1
+    except Exception:
+        UI_COLOR_ATTRS = {}
+
+
+def banner_attr(note: str) -> int:
+    text = (note or "").lower()
+    if "warning" in text or "no reachable" in text:
+        return UI_COLOR_ATTRS.get("error", 0) | curses.A_BOLD
+    if "discovered" in text:
+        return UI_COLOR_ATTRS.get("ok", 0) | curses.A_BOLD
+    if "using configured" in text:
+        return UI_COLOR_ATTRS.get("ok", 0)
+    if "selected control" in text:
+        return UI_COLOR_ATTRS.get("info", 0)
+    return curses.A_DIM
+
+
+def circuit_status_attr(status: str) -> int:
+    text = (status or "").strip().lower()
+    if any(token in text for token in ("failed", "dropped", "error")):
+        return UI_COLOR_ATTRS.get("error", 0) | curses.A_BOLD
+    if text == "ready":
+        return UI_COLOR_ATTRS.get("ok", 0) | curses.A_BOLD
+    if "downloading" in text:
+        return UI_COLOR_ATTRS.get("info", 0) | curses.A_BOLD
+    if "keep-alive" in text:
+        return UI_COLOR_ATTRS.get("idle", 0)
+    if text in {"building", "queued", "rebuilding", "terminating", "starting"}:
+        return UI_COLOR_ATTRS.get("warn", 0) | curses.A_BOLD
+    return 0
+
+
+def add_circuit_row(stdscr, row: int, prefix: str, status_text: str, suffix: str, status_attr: int) -> None:
+    height, width = stdscr.getmaxyx()
+    if not (0 <= row < height):
+        return
+
+    max_width = max(0, width - 1)
+    combined = f"{prefix}{status_text}{suffix}"
+    stdscr.addnstr(row, 0, combined.ljust(max_width), max_width)
+
+    if status_attr and len(prefix) < max_width:
+        status_width = min(len(status_text), max_width - len(prefix))
+        if status_width > 0:
+            stdscr.addnstr(row, len(prefix), status_text[:status_width], status_width, status_attr)
+
+
+def add_circuit_row_colored(
+    stdscr,
+    row: int,
+    prefix: str,
+    status_text: str,
+    suffix: str,
+    status_attr: int,
+    suffix_attr: int = 0,
+) -> None:
+    height, width = stdscr.getmaxyx()
+    if not (0 <= row < height):
+        return
+
+    max_width = max(0, width - 1)
+    combined = f"{prefix}{status_text}{suffix}"
+    stdscr.addnstr(row, 0, combined.ljust(max_width), max_width)
+
+    if status_attr and len(prefix) < max_width:
+        status_width = min(len(status_text), max_width - len(prefix))
+        if status_width > 0:
+            stdscr.addnstr(row, len(prefix), status_text[:status_width], status_width, status_attr)
+
+    if suffix_attr:
+        suffix_start = len(prefix) + len(status_text)
+        if suffix_start < max_width:
+            suffix_width = min(len(suffix), max_width - suffix_start)
+            if suffix_width > 0:
+                stdscr.addnstr(row, suffix_start, suffix[:suffix_width], suffix_width, suffix_attr)
+
+
+def next_available_circuit_slot(app: TorCircuitCollector, after_slot: int = 0) -> Optional[int]:
+    total = int(app.args.circuits)
+    if total <= 0:
+        return None
+
+    start = max(0, min(total, after_slot))
+    order = list(range(start + 1, total + 1)) + list(range(1, start + 1))
+    with app.lock:
+        for index in order:
+            slot = app.slots[index - 1]
+            active_download = slot.download is not None and not slot.download.done and not slot.download.error
+            if slot.circuit_id and not active_download:
+                return index
+    return None
+
+
+def failed_retry_candidates(app: TorCircuitCollector) -> List[Tuple[int, str]]:
+    candidates: List[Tuple[int, str]] = []
+    with app.lock:
+        for slot in app.slots:
+            if slot.download is None:
+                continue
+            if not slot.download.error:
+                continue
+            if not slot.last_url:
+                continue
+            candidates.append((slot.index, slot.last_url))
+    return candidates
+
+
+def download_summary_attr(download: Optional[DownloadState]) -> int:
+    if download is None:
+        return 0
+    if download.error:
+        return UI_COLOR_ATTRS.get("error", 0) | curses.A_BOLD
+    return 0
+
+
+def clipboard_url_text() -> str:
+    # Prefer Wayland clipboard first, then X11 clipboard providers.
+    commands = [
+        ["wl-paste", "-n"],
+        ["xclip", "-selection", "clipboard", "-o"],
+        ["xsel", "--clipboard", "--output"],
+    ]
+
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1.0,
+            )
+            text = (completed.stdout or "").replace("\r\n", "\n").replace("\r", "\n")
+            lines = [line.strip() for line in text.split("\n") if line.strip()]
+            if lines:
+                return lines[0]
+        except Exception:
+            continue
+    return ""
+
+
+def set_clipboard_text(value: str) -> bool:
+    if not value:
+        return False
+
+    # Prefer Wayland first, then X11 providers.
+    commands = [
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+    ]
+
+    for command in commands:
+        if shutil.which(command[0]) is None:
+            continue
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                input=value,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+            if completed.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _parse_ctrl_digit_sequence(chars: str) -> Optional[int]:
+    # xterm/kitty modifyOtherKeys-style Ctrl+digit sequence: ESC [ <code>;5u
+    match = re.fullmatch(r"\[(\d+);5u", chars)
+    if not match:
+        return None
+    code = int(match.group(1))
+    if 48 <= code <= 57:
+        return code - 48
+    return None
+
+
+def read_key_event(stdscr) -> Optional[KeyEvent]:
+    key = stdscr.getch()
+    if key == -1:
+        return None
+    if key != 27:
+        return KeyEvent(key)
+
+    # ESC may be plain Escape or a modified key sequence (Alt/Ctrl with modern protocols).
+    nxt = stdscr.getch()
+    if nxt == -1:
+        return KeyEvent(27)
+
+    if ord("0") <= nxt <= ord("9"):
+        return KeyEvent(nxt, alt=True)
+
+    seq = [nxt]
+    if nxt == ord("["):
+        for _ in range(12):
+            ch = stdscr.getch()
+            if ch == -1:
+                break
+            seq.append(ch)
+            if 64 <= ch <= 126:
+                break
+
+        seq_text = "".join(chr(ch) for ch in seq if 0 <= ch <= 255)
+        ctrl_digit = _parse_ctrl_digit_sequence(seq_text)
+        if ctrl_digit is not None:
+            return KeyEvent(ord(str(ctrl_digit)), ctrl=True)
+
+        # Preserve basic arrows/page navigation if emitted as raw CSI.
+        if seq_text == "[A":
+            return KeyEvent(curses.KEY_UP)
+        if seq_text == "[B":
+            return KeyEvent(curses.KEY_DOWN)
+        if seq_text == "[5~":
+            return KeyEvent(curses.KEY_PPAGE)
+        if seq_text == "[6~":
+            return KeyEvent(curses.KEY_NPAGE)
+
+    return KeyEvent(27)
+
+
 def draw_ui(
     stdscr,
     app: TorCircuitCollector,
     prompt_slot: Optional[int],
     prompt_text: str,
+    retry_prompt_active: bool,
+    retry_prompt_text: str,
     viewer_slot: Optional[int],
     viewer_scroll: int,
+    copy_prompt_active: bool = False,
+    history_view_active: bool = False,
+    clear_prompt_active: bool = False,
+    failed_history_view_active: bool = False,
 ) -> int:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    if height < 12 or width < 80:
-        add_line(stdscr, 0, "Terminal too small. Please use at least 80x12.", curses.A_BOLD)
+    if height < 13 or width < 80:
+        add_line(stdscr, 0, "Terminal too small. Please use at least 80x13.", curses.A_BOLD)
         stdscr.refresh()
         return 0
 
@@ -933,22 +1735,23 @@ def draw_ui(
         message = app.message
 
     title = (
-        f"Tor Circuit Collector | q quit | 1-{app.args.circuits} download | "
+        f"Tor Circuit Collector | q quit | {circuit_key_hint(app.args.circuits)} download | "
         f"refresh {app.args.status_interval}s | output {app.output_dir}"
     )
     add_line(stdscr, 0, title[: width - 1], curses.A_BOLD)
-    add_line(stdscr, 1, "─" * (width - 1))
+    add_line(stdscr, 1, app.port_discovery_line[: width - 1], banner_attr(app.port_discovery_note))
+    add_line(stdscr, 2, "─" * (width - 1))
     add_line(
         stdscr,
-        2,
+        3,
         "#  CircID   Exit relay           Exit IP         Age     Last OK  KA fail  KB URL  Status              Download",
         curses.A_BOLD,
     )
 
-    split_row = height // 2 if viewer_slot is not None else height - 5
+    split_row = height // 2 if (viewer_slot is not None or history_view_active or failed_history_view_active) else height - 5
     table_bottom = max(4, split_row - 1)
 
-    row = 3
+    row = 4
     for slot in slots_snapshot:
         if row >= table_bottom:
             break
@@ -962,30 +1765,113 @@ def draw_ui(
             last_ok = ago_text(slot.last_ok_at)
             failures = str(slot.consecutive_keepalive_failures)
             kb_since_url = f"{slot.bytes_since_last_url / 1024.0:.1f}"
+            download_state = slot.download
             status = slot.status
-            summary = download_summary(slot.download)
+            summary = download_summary(download_state)
             path_summary = slot.path_summary
             last_error = slot.last_error
 
+        display_status = status
+        if download_state is not None and download_state.error:
+            display_status = "download failed"
+            if not last_error:
+                last_error = download_state.error
+
         line = (
             f"{slot.index:<2} {circuit_id:<8.8} {exit_label:<20.20} {exit_ip:<15.15} "
-            f"{age:<7} {last_ok:<8} {failures:<7} {kb_since_url:<7} {status:<19.19} {summary}"
+            f"{age:<7} {last_ok:<8} {failures:<7} {kb_since_url:<7} "
         )
-        add_line(stdscr, row, line)
+        status_text = f"{display_status:<19.19}"
+        add_circuit_row_colored(
+            stdscr,
+            row,
+            line,
+            status_text,
+            summary,
+            circuit_status_attr(display_status),
+            download_summary_attr(download_state),
+        )
         row += 1
         if last_error and row < table_bottom:
-            add_line(stdscr, row, f"   ↳ {last_error}"[: width - 1])
+            add_line(stdscr, row, f"   ↳ {last_error}"[: width - 1], UI_COLOR_ATTRS.get("error", 0))
             row += 1
         if path_summary and app.args.show_paths and row < table_bottom:
             add_line(stdscr, row, f"   path: {path_summary}"[: width - 1])
             row += 1
 
+    if history_view_active:
+        add_line(stdscr, split_row - 1, "─" * (width - 1))
+        with app.lock:
+            lines = list(app.download_history)
+
+        title = "Successful download history (most recent first) | h/Esc close | c clear | Up/Down scroll"
+        add_line(stdscr, split_row, title[: width - 1], curses.A_BOLD)
+
+        body_top = split_row + 1
+        body_bottom = height - 2
+        body_height = max(0, body_bottom - body_top + 1)
+        max_scroll = max(0, len(lines) - body_height)
+        viewer_scroll = max(0, min(viewer_scroll, max_scroll))
+
+        visible = lines[viewer_scroll : viewer_scroll + body_height]
+        for idx in range(body_height):
+            text = visible[idx] if idx < len(visible) else ""
+            add_line(stdscr, body_top + idx, text[: width - 1])
+
+        if lines:
+            position = f"history {viewer_scroll + 1}-{min(viewer_scroll + body_height, len(lines))} of {len(lines)}"
+        else:
+            position = "no successful downloads yet"
+        add_line(stdscr, height - 1, f"Status: {message} | {position}"[: width - 1])
+        stdscr.refresh()
+        return viewer_scroll
+
+    if failed_history_view_active:
+        add_line(stdscr, split_row - 1, "─" * (width - 1))
+        with app.lock:
+            lines = list(app.failed_download_history)
+
+        title = "Failed download history (excludes eventually successful URLs) | f/Esc close | c clear | Up/Down scroll"
+        add_line(stdscr, split_row, title[: width - 1], curses.A_BOLD)
+
+        body_top = split_row + 1
+        body_bottom = height - 2
+        body_height = max(0, body_bottom - body_top + 1)
+        max_scroll = max(0, len(lines) - body_height)
+        viewer_scroll = max(0, min(viewer_scroll, max_scroll))
+
+        visible = lines[viewer_scroll : viewer_scroll + body_height]
+        for idx in range(body_height):
+            text = visible[idx] if idx < len(visible) else ""
+            add_line(stdscr, body_top + idx, text[: width - 1])
+
+        if lines:
+            position = f"failed {viewer_scroll + 1}-{min(viewer_scroll + body_height, len(lines))} of {len(lines)}"
+        else:
+            position = "no unresolved failed downloads"
+        add_line(stdscr, height - 1, f"Status: {message} | {position}"[: width - 1])
+        stdscr.refresh()
+        return viewer_scroll
+
     if viewer_slot is None:
         footer_row = height - 4
         add_line(stdscr, footer_row, "─" * (width - 1))
         add_line(stdscr, footer_row + 1, f"Status: {message}"[: width - 1])
-        if prompt_slot is None:
-            add_line(stdscr, footer_row + 2, "Press 1-5 to enter a download URL for that circuit, or q to quit.")
+        if retry_prompt_active:
+            prompt = "Retry circuit number (press digit to retry, Esc cancels):"
+            add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
+        elif copy_prompt_active:
+            prompt = "Copy URL from circuit (press digit to copy, Esc cancels):"
+            add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
+        elif clear_prompt_active:
+            prompt = "Clear circuit slot (press digit to clear, Esc cancels):"
+            add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
+        elif prompt_slot is None:
+            add_line(
+                stdscr,
+                footer_row + 2,
+                f"Press {circuit_key_hint(app.args.circuits)} for URL prompt, R retry failed URL, N replace, X clear slot, C copy URL, P paste clipboard, H success history, F failed history, or q to quit.",
+            )
         else:
             prompt = f"URL for circuit {prompt_slot} (Enter submits, Esc cancels): {prompt_text}"
             add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
@@ -1027,30 +1913,54 @@ def draw_ui(
 
 
 def curses_main(stdscr, app: TorCircuitCollector) -> None:
+    init_ui_colors()
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.keypad(True)
 
     prompt_slot: Optional[int] = None
     prompt_text = ""
+    retry_prompt_active = False
+    retry_prompt_text = ""
+    copy_prompt_active = False
+    replace_prompt_active = False
+    clear_prompt_active = False
+    history_view_active = False
+    failed_history_view_active = False
     viewer_slot: Optional[int] = None
     viewer_scroll = 0
+    last_paste_slot = 0
     next_draw = 0.0
 
     while not app.stop_event.is_set():
         now = time.monotonic()
         if now >= next_draw:
-            viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+                history_view_active,
+                clear_prompt_active,
+                failed_history_view_active,
+            )
             next_draw = now + app.args.status_interval
 
         try:
-            key = stdscr.getch()
+            key_event = read_key_event(stdscr)
         except KeyboardInterrupt:
             break
 
-        if key == -1:
+        if key_event is None:
             time.sleep(0.05)
             continue
+
+        key = key_event.key
 
         if viewer_slot is not None:
             if key in (ord("c"), ord("C"), 27):
@@ -1068,16 +1978,536 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                 viewer_scroll = max(0, viewer_scroll - 10)
             elif key == curses.KEY_NPAGE:
                 viewer_scroll += 10
-            viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if clear_prompt_active:
+            if key == 27:
+                clear_prompt_active = False
+                curses.curs_set(0)
+                app.set_message("Clear prompt cancelled.")
+            else:
+                selected = key_to_circuit_number(key, app.args.circuits)
+                if selected is None:
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                        history_view_active,
+                        clear_prompt_active,
+                    )
+                    next_draw = time.monotonic() + app.args.status_interval
+                    continue
+                clear_prompt_active = False
+                curses.curs_set(0)
+                interrupted = app.clear_slot_state(selected)
+                if interrupted:
+                    app.set_message(
+                        f"Cleared circuit {selected}; active download interrupted."
+                    )
+                else:
+                    app.set_message(f"Cleared circuit {selected}.")
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+                history_view_active,
+                clear_prompt_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if history_view_active:
+            if key in (ord("h"), ord("H"), 27):
+                history_view_active = False
+                viewer_scroll = 0
+                app.set_message("History viewer closed.")
+            elif key in (ord("c"), ord("C")):
+                app.clear_success_history()
+                viewer_scroll = 0
+                app.set_message("Successful download history cleared.")
+            elif key in (curses.KEY_UP, ord("k"), ord("K")):
+                viewer_scroll = max(0, viewer_scroll - 1)
+            elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                viewer_scroll += 1
+            elif key == curses.KEY_PPAGE:
+                viewer_scroll = max(0, viewer_scroll - 10)
+            elif key == curses.KEY_NPAGE:
+                viewer_scroll += 10
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+                history_view_active,
+                clear_prompt_active,
+                failed_history_view_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if failed_history_view_active:
+            if key in (ord("f"), ord("F"), 27):
+                failed_history_view_active = False
+                viewer_scroll = 0
+                app.set_message("Failed history viewer closed.")
+            elif key in (ord("c"), ord("C")):
+                app.clear_failed_history()
+                viewer_scroll = 0
+                app.set_message("Failed download history cleared.")
+            elif key in (curses.KEY_UP, ord("k"), ord("K")):
+                viewer_scroll = max(0, viewer_scroll - 1)
+            elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                viewer_scroll += 1
+            elif key == curses.KEY_PPAGE:
+                viewer_scroll = max(0, viewer_scroll - 10)
+            elif key == curses.KEY_NPAGE:
+                viewer_scroll += 10
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+                history_view_active,
+                clear_prompt_active,
+                failed_history_view_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if retry_prompt_active:
+            if key == 27:
+                retry_prompt_active = False
+                retry_prompt_text = ""
+                curses.curs_set(0)
+                app.set_message("Retry prompt cancelled.")
+            else:
+                selected = key_to_circuit_number(key, app.args.circuits)
+                if selected is None:
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                    )
+                    next_draw = time.monotonic() + app.args.status_interval
+                    continue
+                retry_prompt_active = False
+                retry_prompt_text = ""
+                curses.curs_set(0)
+                with app.lock:
+                    slot = app.slots[selected - 1]
+                    failed_download = slot.download is not None and bool(slot.download.error)
+                    retry_url = slot.last_url
+                if failed_download and retry_url:
+                    app.set_message(f"Retrying failed URL on circuit {selected}.")
+                    app.start_download(selected, retry_url)
+                else:
+                    app.set_message(
+                        f"Circuit {selected} has no failed download URL to retry."
+                    )
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if copy_prompt_active:
+            if key == 27:
+                copy_prompt_active = False
+                curses.curs_set(0)
+                app.set_message("Copy prompt cancelled.")
+            else:
+                selected = key_to_circuit_number(key, app.args.circuits)
+                if selected is None:
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                    )
+                    next_draw = time.monotonic() + app.args.status_interval
+                    continue
+                copy_prompt_active = False
+                curses.curs_set(0)
+                with app.lock:
+                    slot = app.slots[selected - 1]
+                    url_to_copy = (slot.last_url or (slot.download.url if slot.download else "")).strip()
+                if not url_to_copy:
+                    app.set_message(f"Circuit {selected} has no URL to copy yet.")
+                elif set_clipboard_text(url_to_copy):
+                    app.set_message(f"Copied URL from circuit {selected} to clipboard.")
+                else:
+                    app.set_message(
+                        "Could not write clipboard. Install wl-copy, xclip, or xsel."
+                    )
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if replace_prompt_active:
+            if key == 27:
+                replace_prompt_active = False
+                curses.curs_set(0)
+                app.set_message("Replace prompt cancelled.")
+            else:
+                selected = key_to_circuit_number(key, app.args.circuits)
+                if selected is None:
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                    )
+                    next_draw = time.monotonic() + app.args.status_interval
+                    continue
+                replace_prompt_active = False
+                curses.curs_set(0)
+                with app.lock:
+                    already_rebuilding = app.slots[selected - 1].rebuilding
+                if already_rebuilding:
+                    app.set_message(f"Circuit {selected} is already rebuilding.")
+                else:
+                    interrupted = app.terminate_slot_download(selected)
+                    app.append_slot_output(selected, "Manual circuit replace requested.")
+                    app._start_thread(
+                        target=app.replace_circuit,
+                        name=f"tcc-manual-replace-{selected}",
+                        args=(selected, "manual replace"),
+                    )
+                    if interrupted:
+                        app.set_message(
+                            f"Replacing circuit {selected}; active download interrupted."
+                        )
+                    else:
+                        app.set_message(f"Replacing circuit {selected}.")
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
             next_draw = time.monotonic() + app.args.status_interval
             continue
 
         if prompt_slot is None:
             if key in (ord("q"), ord("Q")):
                 break
-            if ord("1") <= key <= ord(str(min(9, app.args.circuits))):
-                value = key - ord("0")
+            if key in (ord("h"), ord("H")):
+                history_view_active = True
+                failed_history_view_active = False
+                viewer_scroll = 0
+                curses.curs_set(0)
+                app.set_message("Showing successful download history.")
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                    history_view_active,
+                    clear_prompt_active,
+                    failed_history_view_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            if key in (ord("f"), ord("F")):
+                failed_history_view_active = True
+                history_view_active = False
+                viewer_scroll = 0
+                curses.curs_set(0)
+                app.set_message("Showing failed download history (excluding eventually successful URLs).")
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                    history_view_active,
+                    clear_prompt_active,
+                    failed_history_view_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            if key in (ord("x"), ord("X")):
+                clear_prompt_active = True
+                curses.curs_set(0)
+                app.set_message(
+                    f"Press {circuit_key_hint(app.args.circuits)} to clear that slot to ready."
+                )
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                    history_view_active,
+                    clear_prompt_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            if key in (ord("r"), ord("R")):
+                candidates = failed_retry_candidates(app)
+                if len(candidates) == 1:
+                    selected, retry_url = candidates[0]
+                    app.set_message(f"Retrying failed URL on circuit {selected}.")
+                    app.start_download(selected, retry_url)
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                    )
+                    next_draw = time.monotonic() + app.args.status_interval
+                    continue
+
+                if len(candidates) == 0:
+                    app.set_message("No failed download URL available to retry.")
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                    )
+                    next_draw = time.monotonic() + app.args.status_interval
+                    continue
+
+                retry_prompt_active = True
+                retry_prompt_text = ""
+                curses.curs_set(1)
+                app.set_message(
+                    f"Multiple failed circuits. Press {circuit_key_hint(app.args.circuits)} to retry."
+                )
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            if key in (ord("n"), ord("N")):
+                replace_prompt_active = True
+                curses.curs_set(0)
+                app.set_message(
+                    f"Press {circuit_key_hint(app.args.circuits)} to replace that circuit now (active download will be interrupted)."
+                )
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            if key in (ord("c"), ord("C")):
+                copy_prompt_active = True
+                curses.curs_set(0)
+                app.set_message(
+                    f"Press {circuit_key_hint(app.args.circuits)} to copy that slot URL to clipboard."
+                )
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            if key in (ord("p"), ord("P")):
+                clip_url = clipboard_url_text().strip()
+                if not clip_url:
+                    app.set_message(
+                        "Clipboard unavailable or empty. Install wl-paste, xclip, or xsel and copy a URL first."
+                    )
+                else:
+                    selected = next_available_circuit_slot(app, after_slot=last_paste_slot)
+                    if selected is None:
+                        app.set_message("No available ready circuit for clipboard URL paste.")
+                    else:
+                        last_paste_slot = selected
+                        app.set_message(f"Clipboard URL sent to circuit {selected}.")
+                        app.start_download(selected, clip_url)
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
+            value = key_to_circuit_number(key, app.args.circuits)
+            if value is not None:
                 if 1 <= value <= app.args.circuits:
+                    if key_event.ctrl:
+                        with app.lock:
+                            slot = app.slots[value - 1]
+                            failed_download = slot.download is not None and bool(slot.download.error)
+                            retry_url = slot.last_url
+                        if failed_download and retry_url:
+                            app.set_message(f"Retrying failed URL on circuit {value}.")
+                            app.start_download(value, retry_url)
+                        else:
+                            app.set_message(
+                                f"Circuit {value} has no failed download URL to retry with the Ctrl shortcut."
+                            )
+                        viewer_scroll = draw_ui(
+                            stdscr,
+                            app,
+                            prompt_slot,
+                            prompt_text,
+                            retry_prompt_active,
+                            retry_prompt_text,
+                            viewer_slot,
+                            viewer_scroll,
+                            copy_prompt_active,
+                        )
+                        next_draw = time.monotonic() + app.args.status_interval
+                        continue
+
+                    if key_event.alt:
+                        prompt_slot = value
+                        prompt_text = clipboard_url_text()
+                        curses.curs_set(1)
+                        if prompt_text:
+                            app.set_message(f"Clipboard pasted into URL prompt for circuit {value}.")
+                        else:
+                            app.set_message(
+                                "Clipboard unavailable or empty. Enter URL manually (install wl-paste, xclip, or xsel)."
+                            )
+                        viewer_scroll = draw_ui(
+                            stdscr,
+                            app,
+                            prompt_slot,
+                            prompt_text,
+                            retry_prompt_active,
+                            retry_prompt_text,
+                            viewer_slot,
+                            viewer_scroll,
+                            copy_prompt_active,
+                        )
+                        next_draw = time.monotonic() + app.args.status_interval
+                        continue
+
                     with app.lock:
                         slot = app.slots[value - 1]
                         active_download = (
@@ -1093,7 +2523,17 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                         prompt_slot = value
                         prompt_text = ""
                         curses.curs_set(1)
-                    viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+                    viewer_scroll = draw_ui(
+                        stdscr,
+                        app,
+                        prompt_slot,
+                        prompt_text,
+                        retry_prompt_active,
+                        retry_prompt_text,
+                        viewer_slot,
+                        viewer_scroll,
+                        copy_prompt_active,
+                    )
                     next_draw = time.monotonic() + app.args.status_interval
             continue
 
@@ -1103,7 +2543,17 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
             prompt_text = ""
             curses.curs_set(0)
             app.set_message("Download prompt cancelled.")
-            viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
             next_draw = time.monotonic() + app.args.status_interval
         elif key in (curses.KEY_ENTER, 10, 13):
             selected = prompt_slot
@@ -1113,15 +2563,45 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
             curses.curs_set(0)
             if selected is not None:
                 app.start_download(selected, url)
-            viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
             next_draw = time.monotonic() + app.args.status_interval
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             prompt_text = prompt_text[:-1]
-            viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
             next_draw = time.monotonic() + app.args.status_interval
         elif 32 <= key <= 126:
             prompt_text += chr(key)
-            viewer_scroll = draw_ui(stdscr, app, prompt_slot, prompt_text, viewer_slot, viewer_scroll)
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+            )
             next_draw = time.monotonic() + app.args.status_interval
 
 
@@ -1132,12 +2612,48 @@ def positive_int(value: str) -> int:
     return number
 
 
+def nonnegative_int(value: str) -> int:
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return number
+
+
+def positive_float(value: str) -> float:
+    number = float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def parse_port_list(value: str) -> List[int]:
+    ports = TorCircuitCollector._coerce_port_list(value)
+    if not ports:
+        raise argparse.ArgumentTypeError("must contain at least one valid port")
+    return ports
+
+
+def key_to_circuit_number(key: int, max_circuits: int) -> Optional[int]:
+    if ord("1") <= key <= ord("9"):
+        value = key - ord("0")
+        return value if value <= max_circuits else None
+    return None
+
+
+def circuit_key_hint(max_circuits: int) -> str:
+    return f"1-{max_circuits}"
+
+
 BUILTIN_DEFAULTS = {
-    "circuits": 5,
+    "circuits": 9,
     "socks_host": "127.0.0.1",
     "socks_port": 9050,
+    "socks_port_candidates": [],
     "control_host": "127.0.0.1",
     "control_port": 9051,
+    "control_port_candidates": [],
+    "control_port_scan_radius": 10,
+    "port_probe_timeout": 0.6,
     "control_password": None,
     "output_dir": ".",
     "status_interval": 5,
@@ -1157,8 +2673,12 @@ BUILTIN_DEFAULTS = {
 CONFIG_KEY_MAP = {
     ("tor", "socks_host"): "socks_host",
     ("tor", "socks_port"): "socks_port",
+    ("tor", "socks_port_candidates"): "socks_port_candidates",
     ("tor", "control_host"): "control_host",
     ("tor", "control_port"): "control_port",
+    ("tor", "control_port_candidates"): "control_port_candidates",
+    ("tor", "control_port_scan_radius"): "control_port_scan_radius",
+    ("tor", "port_probe_timeout"): "port_probe_timeout",
     ("tor", "control_password"): "control_password",
     ("collector", "circuits"): "circuits",
     ("collector", "keepalive_url"): "keepalive_url",
@@ -1243,8 +2763,28 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--circuits", type=positive_int, help="number of circuits to maintain")
     parser.add_argument("--socks-host", help="Tor SOCKS host")
     parser.add_argument("--socks-port", type=int, help="Tor SOCKS port")
+    parser.add_argument(
+        "--socks-port-candidates",
+        type=parse_port_list,
+        help="comma-separated extra SOCKS ports to probe (example: 9150,9050)",
+    )
     parser.add_argument("--control-host", help="Tor control host")
     parser.add_argument("--control-port", type=int, help="Tor control port")
+    parser.add_argument(
+        "--control-port-candidates",
+        type=parse_port_list,
+        help="comma-separated extra control ports to probe (example: 9151,9051)",
+    )
+    parser.add_argument(
+        "--control-port-scan-radius",
+        type=nonnegative_int,
+        help="probe +/- this many ports around --control-port",
+    )
+    parser.add_argument(
+        "--port-probe-timeout",
+        type=positive_float,
+        help="TCP connect timeout in seconds for port probes",
+    )
     parser.add_argument("--control-password", help="Tor control password, if not using cookie auth")
     parser.add_argument("--output-dir", help="directory for completed downloads")
     parser.add_argument("--status-interval", type=positive_int, help="CLI refresh interval in seconds")

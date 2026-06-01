@@ -2,12 +2,16 @@
   "tor": {
     "socks_host": "127.0.0.1",
     "socks_port": 9050,
+    "socks_port_candidates": [9150],
     "control_host": "127.0.0.1",
     "control_port": 9051,
+    "control_port_candidates": [9151],
+    "control_port_scan_radius": 10,
+    "port_probe_timeout": 0.6,
     "control_password": "Oqv8rVupQB5f9g+QmVSoD4DnvqdGtL60"
   },
   "collector": {
-    "circuits": 5,
+    "circuits": 9,
     "keepalive_url": "https://check.torproject.org/api/ip",
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
