@@ -13,9 +13,14 @@
   "collector": {
     "circuits": 9,
     "keepalive_url": "https://check.torproject.org/api/ip",
+    "keepalive_urls": [
+      "https://check.torproject.org/api/ip",
+      "https://api.ipify.org?format=json",
+      "https://icanhazip.com"
+    ],
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
-    "circuit_build_timeout": 90,
+    "circuit_build_timeout": 108,
     "leave_circuits": false,
     "show_paths": false
   },

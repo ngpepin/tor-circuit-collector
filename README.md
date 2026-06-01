@@ -236,6 +236,7 @@ No Enter needed for these actions:
 - Press `H` to open a scrollable successful-download history pane, with most recent entries at the top.
 - Press `F` to open a scrollable failed-download history pane.
 - If a circuit drops during an active download, the app rebuilds that circuit and automatically re-initiates the interrupted URL after the circuit is ready.
+- Keep-alive checks use an ordered endpoint roster (`keepalive_urls`) and automatically fall back to the next endpoint before counting a keep-alive failure.
 - Failed history excludes any URL that later succeeded.
 - If a URL fails multiple times and has not succeeded yet, only its most recent failure is shown.
 - Press `C` or `c` while viewing success history or failed history to clear that list.
@@ -302,9 +303,14 @@ Command-line flags override JSON values.
   "collector": {
     "circuits": 9,
     "keepalive_url": "https://check.torproject.org/api/ip",
+    "keepalive_urls": [
+      "https://check.torproject.org/api/ip",
+      "https://api.ipify.org?format=json",
+      "https://icanhazip.com"
+    ],
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
-    "circuit_build_timeout": 90,
+    "circuit_build_timeout": 108,
     "leave_circuits": false,
     "show_paths": false
   },
@@ -359,6 +365,7 @@ Common options:
 ./tor-circuit-collector.sh --socks-port-candidates 9150,39050
 ./tor-circuit-collector.sh --control-port-scan-radius 20
 ./tor-circuit-collector.sh --port-probe-timeout 1.0
+./tor-circuit-collector.sh --keepalive-urls "https://check.torproject.org/api/ip,https://api.ipify.org?format=json,https://icanhazip.com"
 ```
 
 Port discovery tuning:

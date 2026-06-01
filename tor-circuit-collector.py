@@ -77,7 +77,12 @@ def ensure_dependencies() -> None:
 
 
 HTTP_CHUNK_SIZE = 256 * 1024
-DEFAULT_KEEPALIVE_URL = "https://check.torproject.org/api/ip"
+DEFAULT_KEEPALIVE_URLS = [
+    "https://check.torproject.org/api/ip",
+    "https://api.ipify.org?format=json",
+    "https://icanhazip.com",
+]
+DEFAULT_KEEPALIVE_URL = DEFAULT_KEEPALIVE_URLS[0]
 USER_AGENT = "tor-circuit-collector/1.0"
 COMMON_CONTROL_PORTS = (9051, 9151)
 COMMON_SOCKS_PORTS = (9050, 9150)
@@ -160,6 +165,10 @@ class TorCircuitCollector:
         self.args = args
         self.output_dir = Path(args.output_dir).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.keepalive_urls: List[str] = list(getattr(args, "keepalive_urls", []) or [])
+        if not self.keepalive_urls:
+            fallback = str(getattr(args, "keepalive_url", "") or "").strip()
+            self.keepalive_urls = [fallback] if fallback else list(DEFAULT_KEEPALIVE_URLS)
 
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
@@ -923,8 +932,13 @@ class TorCircuitCollector:
         if self.controller is None:
             raise RuntimeError("controller is not connected")
 
-        parsed_keepalive = urlsplit(self.args.keepalive_url)
-        keepalive_port = parsed_keepalive.port or (443 if parsed_keepalive.scheme == "https" else 80)
+        keepalive_ports: Set[int] = set()
+        for endpoint in self.keepalive_urls:
+            parsed_keepalive = urlsplit(endpoint)
+            port = parsed_keepalive.port or (443 if parsed_keepalive.scheme == "https" else 80)
+            keepalive_ports.add(int(port))
+        if not keepalive_ports:
+            keepalive_ports.add(443)
 
         # These control-port operations are quick. They can take the lock briefly,
         # unlike circuit construction, which may block for many seconds.
@@ -952,7 +966,7 @@ class TorCircuitCollector:
             exit_policy = getattr(desc, "exit_policy", None)
             if exit_policy is not None and hasattr(exit_policy, "can_exit_to"):
                 try:
-                    can_keepalive = bool(exit_policy.can_exit_to(port=keepalive_port))
+                    can_keepalive = any(bool(exit_policy.can_exit_to(port=port)) for port in keepalive_ports)
                 except Exception:
                     can_keepalive = True
 
@@ -1135,28 +1149,61 @@ class TorCircuitCollector:
             slot.last_keepalive_at = time.monotonic()
 
         try:
-            with slot.io_lock:
-                session = self.session_for_slot(slot_index)
-                try:
-                    response = session.head(
-                        self.args.keepalive_url,
+            def probe_endpoint(session: requests.Session, endpoint: str) -> None:
+                response = session.head(
+                    endpoint,
+                    allow_redirects=True,
+                    timeout=(self.args.connect_timeout, self.args.read_timeout),
+                    headers={"Connection": "keep-alive"},
+                )
+                # Some endpoints reject HEAD; fall back to a tiny GET.
+                if response.status_code >= 400:
+                    response.close()
+                    response = session.get(
+                        endpoint,
                         allow_redirects=True,
                         timeout=(self.args.connect_timeout, self.args.read_timeout),
                         headers={"Connection": "keep-alive"},
                     )
-                    # Some endpoints reject HEAD; fall back to a tiny GET.
-                    if response.status_code >= 400:
-                        response.close()
-                        response = session.get(
-                            self.args.keepalive_url,
-                            allow_redirects=True,
-                            timeout=(self.args.connect_timeout, self.args.read_timeout),
-                            headers={"Connection": "keep-alive"},
-                        )
-                    response.raise_for_status()
-                    response.close()
-                except requests.RequestException:
-                    raise
+                response.raise_for_status()
+                response.close()
+
+            def run_keepalive_probe(session: requests.Session) -> str:
+                last_error: Optional[Exception] = None
+                for endpoint in self.keepalive_urls:
+                    try:
+                        probe_endpoint(session, endpoint)
+                        return endpoint
+                    except requests.RequestException as exc:
+                        last_error = exc
+                        continue
+                if last_error is not None:
+                    raise last_error
+                raise RuntimeError("No keep-alive endpoints are configured.")
+
+            with slot.io_lock:
+                session = self.session_for_slot(slot_index)
+                try:
+                    endpoint_used = run_keepalive_probe(session)
+                except requests.RequestException as first_exc:
+                    # A stale pooled connection can trigger transient SOCKS pool failures.
+                    # Drop and recreate the per-slot session, then retry once.
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+
+                    with self.lock:
+                        cached = self.sessions.get(slot_index)
+                        if cached is session:
+                            self.sessions.pop(slot_index, None)
+
+                    retry_session = self.session_for_slot(slot_index)
+                    try:
+                        endpoint_used = run_keepalive_probe(retry_session)
+                    except requests.RequestException as retry_exc:
+                        raise retry_exc from first_exc
+                    self.append_slot_output(slot_index, "Keep-alive succeeded after session refresh.")
 
             with self.lock:
                 slot.last_ok_at = time.monotonic()
@@ -1170,6 +1217,8 @@ class TorCircuitCollector:
                 else:
                     slot.status = "ready"
                     slot.last_error = ""
+            if endpoint_used != self.keepalive_urls[0]:
+                self.append_slot_output(slot_index, f"Keep-alive fallback endpoint used: {endpoint_used}")
         except Exception as exc:
             rebuild = False
             with self.lock:
@@ -1215,29 +1264,22 @@ class TorCircuitCollector:
             return
 
         slot = self.slots[slot_index - 1]
-        guessed_name = self.filename_from_url(url)
         with self.lock:
-            active = slot.download is not None and not slot.download.done and not slot.download.error
-            if active:
-                self.set_message(f"Circuit {slot_index} is already downloading.")
-                return
             if slot.circuit_id is None:
-                self.set_message(f"Circuit {slot_index} is not ready yet.")
+                self.set_message(f"Circuit {slot_index} is not ready.")
                 return
-            slot.bytes_since_last_url = 0
+            if slot.download is not None and not slot.download.done and not slot.download.error:
+                self.set_message(f"Circuit {slot_index} already downloading.")
+                return
             slot.last_url = url
-            slot.session_output = []
-            slot.download = DownloadState(url=url, filename=guessed_name)
+            slot.bytes_since_last_url = 0
+            slot.download = DownloadState(url=url, filename=self.filename_from_url(url))
             slot.status = "downloading"
             slot.last_error = ""
 
-        self.append_slot_output(slot_index, f"URL submitted: {url}")
-
-        self._start_thread(
-            target=self.download_worker,
-            name=f"tcc-download-{slot_index}",
-            args=(slot_index, url),
-        )
+        self.append_slot_output(slot_index, f"URL queued: {url}")
+        self.set_message(f"Circuit {slot_index} download started.")
+        self._start_thread(target=self.download_worker, name=f"tcc-download-{slot_index}", args=(slot_index, url))
 
     def download_worker(self, slot_index: int, url: str) -> None:
         slot = self.slots[slot_index - 1]
@@ -1367,10 +1409,17 @@ class TorCircuitCollector:
 
     @staticmethod
     def apply_extension_hint(filename: str, extension_hint: str) -> str:
+        extension_hint = extension_hint.lower()
+        if not extension_hint.startswith("."):
+            extension_hint = f".{extension_hint}"
+
         name_path = Path(filename)
         current_suffix = name_path.suffix.lower()
+
         if not current_suffix:
             return sanitize_filename(f"{filename}{extension_hint}")
+        if current_suffix == extension_hint:
+            return filename
         if current_suffix == ".bin" and extension_hint != ".bin":
             return sanitize_filename(f"{name_path.stem}{extension_hint}")
         return filename
@@ -2894,6 +2943,52 @@ def parse_port_list(value: str) -> List[int]:
     return ports
 
 
+def _coerce_keepalive_urls(value: object) -> List[str]:
+    candidates: List[str] = []
+    if value is None:
+        return candidates
+
+    if isinstance(value, str):
+        raw_parts = value.replace("\n", ",").split(",")
+        candidates.extend(part.strip() for part in raw_parts if part.strip())
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            raw_parts = item.replace("\n", ",").split(",")
+            candidates.extend(part.strip() for part in raw_parts if part.strip())
+
+    return candidates
+
+
+def normalize_keepalive_urls(primary_url: object, roster_value: object) -> List[str]:
+    ordered: List[str] = []
+
+    primary = str(primary_url or "").strip() if isinstance(primary_url, str) else ""
+    if primary:
+        ordered.append(primary)
+
+    ordered.extend(_coerce_keepalive_urls(roster_value))
+
+    # Keep built-in fallbacks available unless they were explicitly duplicated.
+    ordered.extend(DEFAULT_KEEPALIVE_URLS)
+
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for endpoint in ordered:
+        parsed = urlsplit(endpoint)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise argparse.ArgumentTypeError(f"invalid keep-alive endpoint: {endpoint}")
+        if endpoint in seen:
+            continue
+        seen.add(endpoint)
+        deduped.append(endpoint)
+
+    if not deduped:
+        raise argparse.ArgumentTypeError("at least one keep-alive endpoint is required")
+    return deduped
+
+
 def key_to_circuit_number(key: int, max_circuits: int) -> Optional[int]:
     if ord("1") <= key <= ord("9"):
         value = key - ord("0")
@@ -2920,8 +3015,9 @@ BUILTIN_DEFAULTS = {
     "status_interval": 5,
     "keepalive_interval": 60,
     "keepalive_url": DEFAULT_KEEPALIVE_URL,
+    "keepalive_urls": list(DEFAULT_KEEPALIVE_URLS),
     "max_keepalive_failures": 2,
-    "circuit_build_timeout": 90,
+    "circuit_build_timeout": 108,
     "connect_timeout": 20,
     "read_timeout": 30,
     "download_read_timeout": 120,
@@ -2943,6 +3039,7 @@ CONFIG_KEY_MAP = {
     ("tor", "control_password"): "control_password",
     ("collector", "circuits"): "circuits",
     ("collector", "keepalive_url"): "keepalive_url",
+    ("collector", "keepalive_urls"): "keepalive_urls",
     ("collector", "keepalive_interval"): "keepalive_interval",
     ("collector", "max_keepalive_failures"): "max_keepalive_failures",
     ("collector", "circuit_build_timeout"): "circuit_build_timeout",
@@ -3051,6 +3148,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--status-interval", type=positive_int, help="CLI refresh interval in seconds")
     parser.add_argument("--keepalive-interval", type=positive_int, help="seconds between keep-alive requests per idle circuit")
     parser.add_argument("--keepalive-url", help="URL used for circuit keep-alive checks")
+    parser.add_argument(
+        "--keepalive-urls",
+        help="comma-separated keep-alive endpoints tried in order as fallbacks",
+    )
     parser.add_argument("--max-keepalive-failures", type=positive_int, help="rebuild a circuit after this many keep-alive failures")
     parser.add_argument("--circuit-build-timeout", type=positive_int, help="seconds to wait for a new Tor circuit")
     parser.add_argument("--connect-timeout", type=positive_int, help="HTTP connect timeout in seconds")
@@ -3077,6 +3178,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Normalize after CLI overrides too. CLI relative output-dir remains relative to cwd,
     # unlike config relative output_dir which is already resolved relative to the config file.
     args.config = str(Path(args.config).expanduser().resolve())
+    try:
+        keepalive_urls = normalize_keepalive_urls(args.keepalive_url, getattr(args, "keepalive_urls", None))
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    args.keepalive_urls = keepalive_urls
+    args.keepalive_url = keepalive_urls[0]
     return args
 
 
