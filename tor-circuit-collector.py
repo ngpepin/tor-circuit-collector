@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from email.message import Message
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 # Imported lazily so --help works even before dependencies are installed.
 requests = None
@@ -101,6 +101,7 @@ class DownloadState:
     url: str
     filename: str
     started_at: float = field(default_factory=time.monotonic)
+    ended_at: Optional[float] = None
     bytes_done: int = 0
     total_bytes: Optional[int] = None
     cancel_requested: bool = False
@@ -1232,7 +1233,8 @@ class TorCircuitCollector:
                     response.raise_for_status()
                     total_header = response.headers.get("Content-Length")
                     content_length = int(total_header) if total_header and total_header.isdigit() else None
-                    name = self.filename_from_response(url, response.headers, guessed_name)
+                    resolved_url = response.url or url
+                    name = self.filename_from_response(resolved_url, response.headers, guessed_name)
                     final_path = self.unique_path(self.output_dir / name)
                     part_path = final_path.with_suffix(final_path.suffix + ".part")
                     state.filename = final_path.name
@@ -1267,6 +1269,7 @@ class TorCircuitCollector:
             with self.lock:
                 if slot.download is state:
                     state.done = True
+                    state.ended_at = time.monotonic()
                     slot.status = "ready"
                     slot.last_ok_at = time.monotonic()
                     slot.last_error = ""
@@ -1289,6 +1292,7 @@ class TorCircuitCollector:
                     pass
             with self.lock:
                 state.error = self._short_error(exc)
+                state.ended_at = time.monotonic()
                 if slot.download is state:
                     slot.status = "download failed"
                     slot.last_error = state.error
@@ -1319,15 +1323,24 @@ class TorCircuitCollector:
 
         normalized = sanitize_filename(candidate)
         content_type = headers.get("Content-Type", "")
-        extension_hint = self.extension_from_content_type(content_type)
+        extension_hint = self.extension_from_content_type(content_type) or self.extension_from_url(url)
         if extension_hint:
-            name_path = Path(normalized)
-            current_suffix = name_path.suffix.lower()
-            if not current_suffix:
-                normalized = sanitize_filename(f"{normalized}{extension_hint}")
-            elif current_suffix == ".bin" and extension_hint != ".bin":
-                normalized = sanitize_filename(f"{name_path.stem}{extension_hint}")
+            normalized = self.apply_extension_hint(normalized, extension_hint)
+
+        # Never keep extensionless filenames; force a safe fallback extension.
+        if not Path(normalized).suffix:
+            normalized = sanitize_filename(f"{normalized}.bin")
         return normalized
+
+    @staticmethod
+    def apply_extension_hint(filename: str, extension_hint: str) -> str:
+        name_path = Path(filename)
+        current_suffix = name_path.suffix.lower()
+        if not current_suffix:
+            return sanitize_filename(f"{filename}{extension_hint}")
+        if current_suffix == ".bin" and extension_hint != ".bin":
+            return sanitize_filename(f"{name_path.stem}{extension_hint}")
+        return filename
 
     @staticmethod
     def extension_from_content_type(content_type: str) -> Optional[str]:
@@ -1343,6 +1356,40 @@ class TorCircuitCollector:
         if extension and not extension.startswith("."):
             extension = f".{extension}"
         return extension
+
+    @staticmethod
+    def extension_from_url(url: str) -> Optional[str]:
+        parsed = urlsplit(url)
+
+        # Try path extension first.
+        path_ext = TorCircuitCollector.validate_extension(Path(unquote(parsed.path)).suffix.lower())
+        if path_ext:
+            return path_ext
+
+        # Then common query params carrying filename-like values.
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=False)
+        except Exception:
+            return None
+
+        for key in ("filename", "file", "name", "download", "attachment"):
+            values = query.get(key)
+            if not values:
+                continue
+            for value in reversed(values):
+                ext = TorCircuitCollector.validate_extension(Path(unquote(value)).suffix.lower())
+                if ext:
+                    return ext
+        return None
+
+    @staticmethod
+    def validate_extension(ext: str) -> Optional[str]:
+        if not ext:
+            return None
+        ext = ext.strip().lower()
+        if not re.fullmatch(r"\.[a-z0-9]{1,10}", ext):
+            return None
+        return ext
 
     @staticmethod
     def unique_path(path: Path) -> Path:
@@ -1452,6 +1499,16 @@ def download_summary(download: Optional[DownloadState]) -> str:
         f"{human_bytes(download.bytes_done)}/{human_bytes(download.total_bytes)} "
         f"@ {human_bytes(int(rate))}/s"
     )
+
+
+def average_mbps_text(download: Optional[DownloadState]) -> str:
+    if download is None or download.bytes_done <= 0:
+        return "-"
+
+    end_time = download.ended_at if download.ended_at is not None else time.monotonic()
+    elapsed = max(0.001, end_time - download.started_at)
+    mbps = (download.bytes_done * 8.0) / 1_000_000.0 / elapsed
+    return f"{mbps:.2f}"
 
 
 def add_line(stdscr, row: int, text: str, attr: int = 0) -> None:
@@ -1755,7 +1812,7 @@ def draw_ui(
     add_line(
         stdscr,
         3,
-        "#  CircID   Exit relay           Exit IP         Age     Last OK  KA fail  KB URL  Status              Download",
+        "#  CircID   Exit relay           Exit IP         Age     Last OK  KA fail  KB URL  Avg Mbps Status              Download",
         curses.A_BOLD,
     )
 
@@ -1777,6 +1834,7 @@ def draw_ui(
             failures = str(slot.consecutive_keepalive_failures)
             kb_since_url = f"{slot.bytes_since_last_url / 1024.0:.1f}"
             download_state = slot.download
+            avg_mbps = average_mbps_text(download_state)
             status = slot.status
             summary = download_summary(download_state)
             path_summary = slot.path_summary
@@ -1790,7 +1848,7 @@ def draw_ui(
 
         line = (
             f"{slot.index:<2} {circuit_id:<8.8} {exit_label:<20.20} {exit_ip:<15.15} "
-            f"{age:<7} {last_ok:<8} {failures:<7} {kb_since_url:<7} "
+            f"{age:<7} {last_ok:<8} {failures:<7} {kb_since_url:<7} {avg_mbps:<8} "
         )
         status_text = f"{display_status:<19.19}"
         add_circuit_row_colored(

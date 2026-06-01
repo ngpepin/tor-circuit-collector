@@ -244,7 +244,7 @@ No Enter needed for these actions:
 - Press `Esc` while entering a URL to cancel the prompt.
 - Press `q` to quit.
 
-The UI shows each circuit's current Tor circuit ID, exit relay, age, keep-alive status, failure count, and download progress.
+The UI shows each circuit's current Tor circuit ID, exit relay, age, keep-alive status, failure count, KB downloaded since last URL, average Mbps for the current/last transfer, and download progress.
 
 Status display and colors:
 
@@ -390,19 +390,21 @@ On shutdown, the script attempts to restore the previous `__LeaveStreamsUnattach
 
 Downloads are streamed in chunks and written first to a `.part` file. When a download completes, the `.part` file is atomically moved to the final filename.
 
-If the server provides a `Content-Disposition` filename, that name is used. Otherwise, the filename is inferred from the URL path. Existing filenames are not overwritten; the script appends `-1`, `-2`, and so on.
+If the server provides a `Content-Disposition` filename, that name is used. Otherwise, the filename is inferred from the final response URL (path and common filename query parameters). Existing filenames are not overwritten; the script appends `-1`, `-2`, and so on.
 
 Filename post-processing is applied before writing files:
 
 - Names are normalized (unsafe path/control characters removed, whitespace collapsed).
 - Very long names are shortened to keep them manageable while preserving the file extension.
-- If the filename has no extension (or only `.bin`), the app tries to infer one from HTTP `Content-Type` (for example `.pdf` or `.epub`).
+- If the filename has no extension (or only `.bin`), the app tries to infer one from HTTP `Content-Type` and URL filename hints (for example `.pdf` or `.epub`).
+- If no reliable extension can be inferred, the app forces a `.bin` extension so files are never saved extensionless.
 
 History persistence:
 
 - Successful download history is persisted in the script directory as `tor-circuit-collector.success-history.jsonl`.
 - Failed download history is persisted in the script directory as `tor-circuit-collector.failed-history.jsonl`.
 - Failed history is cross-checked against successful URLs so entries are hidden/removed once that URL eventually succeeds.
+- In failed history, only the most recent unresolved failure per URL is shown in the viewer.
 
 By default, failed partial downloads are removed. To keep them:
 
