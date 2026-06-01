@@ -322,10 +322,21 @@ class TorCircuitCollector:
 
     def rebuild_history_views_locked(self) -> None:
         self.download_history = [self.build_history_line(rec, failed=False) for rec in self.success_history_records]
+        deduped_failed: List[Dict[str, object]] = []
+        seen_urls: Set[str] = set()
+        for rec in self.failed_history_records:
+            url_norm = str(rec.get("url_norm", ""))
+            if url_norm in self.successful_urls:
+                continue
+            if url_norm and url_norm in seen_urls:
+                continue
+            if url_norm:
+                seen_urls.add(url_norm)
+            deduped_failed.append(rec)
+
         self.failed_download_history = [
             self.build_history_line(rec, failed=True)
-            for rec in self.failed_history_records
-            if str(rec.get("url_norm", "")) not in self.successful_urls
+            for rec in deduped_failed
         ]
 
     @staticmethod

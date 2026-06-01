@@ -236,6 +236,7 @@ No Enter needed for these actions:
 - Press `H` to open a scrollable successful-download history pane, with most recent entries at the top.
 - Press `F` to open a scrollable failed-download history pane.
 - Failed history excludes any URL that later succeeded.
+- If a URL fails multiple times and has not succeeded yet, only its most recent failure is shown.
 - Press `C` or `c` while viewing success history or failed history to clear that list.
 - Optional terminal-dependent shortcuts: `Ctrl+<number>` retries a failed URL for that circuit, and `Alt+<number>` opens that circuit URL prompt prefilled from clipboard.
 - Enter an absolute `http://` or `https://` URL.
