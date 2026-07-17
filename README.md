@@ -9,6 +9,7 @@ The interface uses an in-place `curses` display, so status refreshes do not scro
 ```text
 tor-circuit-collector.py      Main Python CLI application
 tor-circuit-collector.sh      Bash runner that works from any current directory
+apt-install-tor.sh            Install/update and hold official Tor + GeoIP packages
 tor-circuit-collector.json    JSON configuration file
 README.md                     This file
 ```
@@ -97,12 +98,18 @@ sequenceDiagram
 python3 -m pip install stem "requests[socks]"
 ```
 
-On Debian or Ubuntu systems, Tor can usually be installed with:
+On Debian or Ubuntu-family systems, install the current Tor Project packages
+and hold Tor plus its GeoIP database with:
 
 ```bash
-sudo apt update
-sudo apt install tor
+./apt-install-tor.sh
 ```
+
+The installer verifies Tor Project's repository signing key, configures the
+official repository for the system's distribution codename, replaces outdated
+`tor` and `tor-geoipdb` packages, and holds both installed packages. Re-run it
+to check for a newer stable release; it temporarily removes the holds only when
+an update is needed and restores them after a successful installation.
 
 ## Tor configuration
 
