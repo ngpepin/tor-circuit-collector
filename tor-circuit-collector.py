@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from email.message import Message
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qsl, parse_qs, quote, unquote, urlsplit, urlunsplit
 
 # Imported lazily so --help works even before dependencies are installed.
 requests = None
@@ -197,7 +197,15 @@ class TorCircuitCollector:
         self.username_to_slot: Dict[str, int] = {
             self.slot_username(slot.index): slot.index for slot in self.slots
         }
-        self.threads: List[threading.Thread] = []
+        self.threads: Set[threading.Thread] = set()
+        # Serializes atomic destination-name reservation across slots so two
+        # transfers can never publish to the same final path.
+        self.filename_lock = threading.Lock()
+        # In-memory diagnostics: named counters for the Step 0 measurements plus
+        # a bounded ring of recent non-fatal notes, surfaced by the D viewer.
+        self.debug_events: List[str] = []
+        self.debug_counters: Dict[str, float] = {}
+        self.debug_limit = 400
         self.reserved_exit_fingerprints: Set[str] = set()
         self.download_history: List[str] = []
         self.failed_download_history: List[str] = []
@@ -235,6 +243,36 @@ class TorCircuitCollector:
     def set_message(self, text: str) -> None:
         with self.lock:
             self.message = text
+
+    def record(self, name: str, amount: float = 1.0) -> None:
+        """Add to a named diagnostic counter (rendered by the D viewer)."""
+        with self.lock:
+            self.debug_counters[name] = self.debug_counters.get(name, 0.0) + float(amount)
+
+    def debug_log(self, text: str) -> None:
+        """Append one bounded diagnostic line. Cheap; no I/O."""
+        timestamp = time.strftime("%H:%M:%S")
+        with self.lock:
+            self.debug_events.append(f"[{timestamp}] {text}")
+            overflow = len(self.debug_events) - self.debug_limit
+            if overflow > 0:
+                del self.debug_events[:overflow]
+
+    def _note(self, area: str, exc: Exception) -> None:
+        """Record a non-fatal failure instead of swallowing it silently."""
+        self.debug_log(f"{area}: {self._short_error(exc)}")
+
+    def debug_lines(self) -> List[str]:
+        with self.lock:
+            counters = sorted(self.debug_counters.items())
+            events = list(self.debug_events)
+        lines = [f"{name}: {value:g}" for name, value in counters]
+        if lines:
+            lines.append("")
+        lines.extend(events)
+        if not lines:
+            lines = ["No diagnostics recorded yet."]
+        return lines
 
     def append_slot_output(self, slot_index: int, text: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -329,7 +367,34 @@ class TorCircuitCollector:
 
     @staticmethod
     def normalize_history_url(url: str) -> str:
-        return url.strip()
+        """Normalize a URL for history dedup/keys.
+
+        Conservative on purpose: the fragment is dropped, scheme and host are
+        lower-cased, the default port is removed, and query parameters are
+        sorted. Query values and path case are preserved because they often
+        identify the document.
+        """
+        stripped = url.strip()
+        try:
+            parts = urlsplit(stripped)
+            port = parts.port
+        except ValueError:
+            return stripped
+
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        if not scheme or not host:
+            return stripped
+        if port and not (
+            (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+        ):
+            host = f"{host}:{port}"
+        path = parts.path or "/"
+        pairs = sorted(parse_qsl(parts.query, keep_blank_values=True))
+        query = "&".join(
+            f"{quote(str(key), safe='')}={quote(str(value), safe='')}" for key, value in pairs
+        )
+        return urlunsplit((scheme, host, path, query, ""))
 
     @staticmethod
     def build_history_line(entry: Dict[str, object], failed: bool) -> str:
@@ -396,12 +461,25 @@ class TorCircuitCollector:
 
     @staticmethod
     def rewrite_history_file(path: Path, entries: List[Dict[str, object]]) -> None:
+        """Rewrite a history file atomically.
+
+        The previous implementation opened with ``"w"`` and wrote line by
+        line, so a crash mid-write left a truncated history with no backup.
+        Write a sibling temp file and ``os.replace()`` it into place instead.
+        """
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            with path.open("w", encoding="utf-8") as fh:
+            with tmp_path.open("w", encoding="utf-8") as fh:
                 for entry in entries:
                     fh.write(json.dumps(entry, ensure_ascii=True) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, path)
         except OSError:
-            pass
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
     def load_persistent_histories(self) -> None:
         success_raw = self.load_history_file(self.success_history_file)
@@ -465,7 +543,7 @@ class TorCircuitCollector:
                 return False
             state.cancel_requested = True
             slot.status = "terminating"
-            session_to_close = self.sessions.pop(slot_index, None)
+            session_to_close = self.discard_session(slot_index)
         if session_to_close is not None:
             try:
                 session_to_close.close()
@@ -492,8 +570,9 @@ class TorCircuitCollector:
     def start(self) -> None:
         self.connect_controller()
         monitor = threading.Thread(target=self.monitor_loop, name="tcc-monitor", daemon=True)
+        with self.lock:
+            self.threads.add(monitor)
         monitor.start()
-        self.threads.append(monitor)
 
     @staticmethod
     def _unique_ports(ports: List[int]) -> List[int]:
@@ -723,6 +802,11 @@ class TorCircuitCollector:
                 controller.set_conf("__LeaveStreamsUnattached", "1")
                 controller.add_event_listener(self.on_stream_event, EventType.STREAM)
                 controller.add_event_listener(self.on_circ_event, EventType.CIRC)
+                # Cheap stale-cache guard; a new consensus invalidates cached flags.
+                try:
+                    controller.add_event_listener(self.on_ns_event, EventType.NS)
+                except Exception as exc:
+                    self._note("NS event subscription", exc)
 
             self.controller = controller
             self.set_message(
@@ -744,6 +828,7 @@ class TorCircuitCollector:
                 try:
                     controller.remove_event_listener(self.on_stream_event)
                     controller.remove_event_listener(self.on_circ_event)
+                    controller.remove_event_listener(self.on_ns_event)
                 except Exception:
                     pass
 
@@ -770,7 +855,10 @@ class TorCircuitCollector:
                 except Exception:
                     pass
 
-        for session in list(self.sessions.values()):
+        with self.lock:
+            sessions_to_close = list(self.sessions.values())
+            self.sessions.clear()
+        for session in sessions_to_close:
             try:
                 session.close()
             except Exception:
@@ -811,9 +899,23 @@ class TorCircuitCollector:
             self.stop_event.wait(1.0)
 
     def _start_thread(self, target, name: str, args: Tuple = ()) -> None:
-        t = threading.Thread(target=target, name=name, args=args, daemon=True)
-        t.start()
-        self.threads.append(t)
+        """Start a daemon thread and forget it as soon as it finishes.
+
+        The registry used to grow forever: a multi-day session accumulated
+        thousands of dead ``Thread`` objects and kept their frames alive.
+        """
+
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self.lock:
+                    self.threads.discard(threading.current_thread())
+
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        with self.lock:
+            self.threads.add(thread)
+        thread.start()
 
     def replace_circuit(self, slot_index: int, reason: str) -> None:
         slot = self.slots[slot_index - 1]
@@ -849,7 +951,7 @@ class TorCircuitCollector:
                 active_state.keep_part_for_resume = True
                 slot.resume_part_path = active_state.part_path
                 slot.resume_final_path = active_state.final_path
-                session_to_close = self.sessions.pop(slot_index, None)
+                session_to_close = self.discard_session(slot_index)
 
             slot.pending_resume_url = resume_url
             if not resume_url:
@@ -887,6 +989,8 @@ class TorCircuitCollector:
 
             self.build_semaphore.acquire()
             acquired_build_slot = True
+            build_started = time.monotonic()
+            self.record("circuit_builds")
 
             with self.lock:
                 slot.status = "building"
@@ -972,10 +1076,14 @@ class TorCircuitCollector:
                 slot.last_ok_at = now
 
             self.set_message(f"Circuit {slot.index} ready as Tor circuit {circuit_id}.")
+            self.record("circuit_builds_ok")
+            self.record("circuit_build_seconds", time.monotonic() - build_started)
             if resume_url and not self.stop_event.is_set():
                 self.append_slot_output(slot_index, f"Circuit rebuilt; resuming download: {resume_url}")
                 self.start_download(slot_index, resume_url)
         except Exception as exc:
+            self.record("circuit_builds_failed")
+            self._note("circuit build", exc)
             with self.lock:
                 if planned_exit:
                     self.reserved_exit_fingerprints.discard(planned_exit)
@@ -1006,8 +1114,10 @@ class TorCircuitCollector:
             with self.lock:
                 cached_at, cached = self.relay_cache
                 if cached and 0.0 <= time.monotonic() - cached_at < ttl:
+                    self.record("relay_cache_hits")
                     return cached
 
+        self.record("relay_cache_misses")
         candidates = self._fetch_relay_candidates()
         if ttl > 0:
             with self.lock:
@@ -1145,6 +1255,8 @@ class TorCircuitCollector:
             return
         circuit_id = str(getattr(event, "id", ""))
         reason = getattr(event, "reason", "") or getattr(event, "remote_reason", "") or status
+        self.record("circuits_dropped")
+        self.debug_log(f"circuit {circuit_id} {status}: {reason}")
         with self.lock:
             for slot in self.slots:
                 if slot.circuit_id == circuit_id:
@@ -1174,13 +1286,32 @@ class TorCircuitCollector:
                 if circuit_id:
                     with self.control_lock:
                         self.controller.attach_stream(stream_id, circuit_id)  # type: ignore[union-attr]
+                    self.record("streams_attached")
                     return
 
             # Avoid breaking unrelated applications while __LeaveStreamsUnattached=1.
             with self.control_lock:
                 self.controller.attach_stream(stream_id, 0)  # type: ignore[union-attr]
         except Exception as exc:
+            self.record("stream_attach_failures")
+            self._note("stream attach", exc)
             self.set_message(f"Stream attach failed: {self._short_error(exc)}")
+
+    def on_ns_event(self, event) -> None:
+        """Drop the relay cache when Tor publishes a new consensus.
+
+        The cache holds only flags from one snapshot. If a new consensus
+        arrives while slots are choosing paths, the cached exit fingerprints
+        can name relays Tor no longer accepts, which rejects the whole planned
+        path and forces a rebuild. Invalidating here is ~free.
+        """
+        del event  # The event body is not needed; any NS means "new consensus".
+        with self.lock:
+            cached = bool(self.relay_cache[1])
+            self.relay_cache = (0.0, [])
+        self.record("consensus_invalidations")
+        if cached:
+            self.debug_log("consensus changed; relay cache invalidated")
 
     @staticmethod
     def _event_kv(event, key: str) -> Optional[str]:
@@ -1217,18 +1348,40 @@ class TorCircuitCollector:
         value = match.group(1) if match.group(1) is not None else match.group(2)
         return value.replace(r"\"", '"')
 
-    def session_for_slot(self, slot_index: int) -> requests.Session:
-        session = self.sessions.get(slot_index)
-        if session is not None:
-            return session
+    def _build_session(self, slot_index: int) -> "requests.Session":
         username = quote(self.slot_username(slot_index), safe="")
         password = quote(self.socks_password, safe="")
         proxy = f"socks5h://{username}:{password}@{self.args.socks_host}:{self.args.socks_port}"
         session = requests.Session()
         session.proxies = {"http": proxy, "https": proxy}
         session.headers.update({"User-Agent": USER_AGENT})
-        self.sessions[slot_index] = session
         return session
+
+    def session_for_slot(self, slot_index: int) -> "requests.Session":
+        """Return the per-slot session, creating it under ``self.lock``.
+
+        Only the map is serialized; the network call never runs under the lock.
+        Two threads asking for the same slot therefore share one session
+        instead of racing to build two whose proxies may disagree.
+        """
+        with self.lock:
+            session = self.sessions.get(slot_index)
+            if session is None:
+                session = self._build_session(slot_index)
+                self.sessions[slot_index] = session
+            return session
+
+    def discard_session(
+        self, slot_index: int, session: Optional["requests.Session"] = None
+    ) -> Optional["requests.Session"]:
+        """Remove a session from the map, optionally only if it is still current."""
+        with self.lock:
+            cached = self.sessions.get(slot_index)
+            if cached is None:
+                return None
+            if session is not None and cached is not session:
+                return None
+            return self.sessions.pop(slot_index, None)
 
     def keepalive_once(self, slot_index: int) -> None:
         slot = self.slots[slot_index - 1]
@@ -1286,10 +1439,7 @@ class TorCircuitCollector:
                     except Exception:
                         pass
 
-                    with self.lock:
-                        cached = self.sessions.get(slot_index)
-                        if cached is session:
-                            self.sessions.pop(slot_index, None)
+                    self.discard_session(slot_index, session)
 
                     retry_session = self.session_for_slot(slot_index)
                     try:
@@ -1435,6 +1585,43 @@ class TorCircuitCollector:
         start = self._content_range_start(response.headers.get("Content-Range", ""))
         return start == resume_from
 
+    def _download_request(self, session: "requests.Session", url: str, headers: Dict[str, str]):
+        """Issue one streaming GET, retrying transient transport failures.
+
+        Only connect/read errors and 5xx/429 responses are retried; a 4xx is a
+        definitive answer and must reach the caller. Backoff is exponential so
+        a flapping circuit does not hammer the SOCKS port.
+        """
+        timeout = (self.args.connect_timeout, self.args.download_read_timeout)
+        attempts = max(0, int(getattr(self.args, "http_retries", 0) or 0)) + 1
+        backoff = max(0.0, float(getattr(self.args, "retry_backoff", 0.0) or 0.0))
+        last_exc: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                response = session.get(url, stream=True, timeout=timeout, headers=headers)
+            except requests.RequestException as exc:
+                last_exc = exc
+                self.record("download_retries")
+                self.debug_log(f"download retry {attempt + 1}/{attempts}: {self._short_error(exc)}")
+                if attempt + 1 >= attempts:
+                    raise
+                if self.stop_event.wait(backoff * (2 ** attempt)):
+                    raise RuntimeError("stopped") from exc
+                continue
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt + 1 < attempts:
+                self.record("download_retries")
+                self.debug_log(
+                    f"download retry {attempt + 1}/{attempts}: HTTP {response.status_code}"
+                )
+                response.close()
+                if self.stop_event.wait(backoff * (2 ** attempt)):
+                    raise RuntimeError("stopped")
+                continue
+            return response
+
+        raise last_exc if last_exc is not None else RuntimeError("download request failed")
+
     def _open_download_response(self, session: "requests.Session", url: str, resume_from: int):
         """Open the download response, retrying once without ``Range`` on HTTP 416.
 
@@ -1442,16 +1629,56 @@ class TorCircuitCollector:
         resource (it changed, shrank, or was written by an older run). In that
         case the only correct action is to discard it and fetch from byte 0.
         """
-        timeout = (self.args.connect_timeout, self.args.download_read_timeout)
-        headers = {"Connection": "keep-alive"}
+        headers = {"Connection": "keep-alive", "Accept-Encoding": "identity"}
         if resume_from > 0:
             headers["Range"] = f"bytes={resume_from}-"
-        response = session.get(url, stream=True, timeout=timeout, headers=headers)
+        response = self._download_request(session, url, headers)
         if resume_from > 0 and response.status_code == 416:
             response.close()
             headers.pop("Range", None)
-            response = session.get(url, stream=True, timeout=timeout, headers=headers)
+            response = self._download_request(session, url, headers)
         return response
+
+    @staticmethod
+    def _parse_content_length(headers) -> Optional[int]:
+        """Return a sane ``Content-Length`` or ``None``.
+
+        The header is attacker-controlled, so reject non-numeric values and
+        anything negative instead of letting ``int()`` raise mid-transfer.
+        """
+        raw = headers.get("Content-Length") if headers is not None else None
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text.isdigit():
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    def _ensure_free_space(self, required: Optional[int]) -> None:
+        """Fail early when the output filesystem cannot hold the transfer.
+
+        Running out of space a gigabyte into a download leaves a partial and a
+        confusing OSError; checking up front turns it into an actionable
+        message.
+        """
+        margin_mb = max(0, int(getattr(self.args, "min_free_space_mb", 0) or 0))
+        needed = int(required or 0) + margin_mb * 1024 * 1024
+        if needed <= 0:
+            return
+        try:
+            free = int(shutil.disk_usage(self.output_dir).free)
+        except OSError as exc:
+            self._note("disk usage check", exc)
+            return
+        if free < needed:
+            raise RuntimeError(
+                f"not enough free space in {self.output_dir}: need {human_bytes(needed)}, "
+                f"have {human_bytes(free)}"
+            )
 
     def download_worker(self, slot_index: int, url: str) -> None:
         slot = self.slots[slot_index - 1]
@@ -1507,23 +1734,26 @@ class TorCircuitCollector:
                             raise RuntimeError("server rejected the resume request")
 
                         response.raise_for_status()
-                        total_header = response.headers.get("Content-Length")
-                        content_length = int(total_header) if total_header and total_header.isdigit() else None
+                        content_length = self._parse_content_length(response.headers)
                         if content_length is not None and attempt_from > 0:
                             content_length += attempt_from
 
                         if part_path is None or final_path is None:
-                            # No partial reserved (fresh transfer), so pick a
-                            # destination. When a partial already exists the
-                            # paths are reused, letting the truncating write
-                            # below replace it in place instead of orphaning it.
+                            # No partial reserved (fresh transfer), so reserve a
+                            # destination atomically. When a partial already
+                            # exists the paths are reused, letting the
+                            # truncating write below replace it in place
+                            # instead of orphaning it.
                             attempt_from = 0
                             resolved_url = response.url or url
                             name = self.filename_from_response(resolved_url, response.headers, guessed_name)
-                            final_path = self.unique_path(self.output_dir / name)
+                            final_path = self.reserve_download_path(self.output_dir / name)
                             part_path = final_path.with_suffix(final_path.suffix + ".part")
+                            self.record("paths_reserved")
                         if final_path is None or part_path is None:
                             raise RuntimeError("could not reserve a destination path")
+                        if attempt_from <= 0:
+                            self._ensure_free_space(content_length)
 
                         state.filename = final_path.name
                         state.total_bytes = content_length
@@ -1715,19 +1945,41 @@ class TorCircuitCollector:
         return ext
 
     @staticmethod
-    def unique_path(path: Path) -> Path:
+    def _candidate_paths(path: Path):
+        """Yield sanitized final-path candidates, the desired name first."""
         path = path.with_name(sanitize_filename(path.name))
-        if not path.exists():
-            return path
+        yield path
         stem = path.stem
         suffix = path.suffix
         parent = path.parent
         counter = 1
         while True:
-            candidate = parent / f"{stem}-{counter}{suffix}"
-            if not candidate.exists() and not candidate.with_suffix(candidate.suffix + ".part").exists():
-                return candidate
+            yield parent / f"{stem}-{counter}{suffix}"
             counter += 1
+
+    def reserve_download_path(self, desired: Path) -> Path:
+        """Atomically reserve a final path together with its ``.part`` file.
+
+        A plain "first name that looks free" check is a check-then-act race:
+        two slots downloading the same URL can both observe a name as free,
+        and the second ``os.replace()`` then silently clobbers the first
+        finished file. ``O_EXCL`` creation of the partial makes the reservation
+        atomic across threads and processes. The created file is empty; the
+        downloader either truncates it with ``"wb"`` or appends to it after a
+        resume.
+        """
+        with self.filename_lock:
+            for candidate in self._candidate_paths(desired):
+                if candidate.exists():
+                    continue
+                part = candidate.with_suffix(candidate.suffix + ".part")
+                try:
+                    fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError:
+                    continue
+                os.close(fd)
+                return candidate
+        raise RuntimeError("could not reserve a unique download filename")
 
     @staticmethod
     def _short_error(exc: Exception, limit: int = 120) -> str:
@@ -2230,6 +2482,7 @@ def draw_ui(
     history_view_active: bool = False,
     clear_prompt_active: bool = False,
     failed_history_view_active: bool = False,
+    debug_view_active: bool = False,
 ) -> int:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -2250,7 +2503,11 @@ def draw_ui(
     add_line(stdscr, 1, app.port_discovery_line[: width - 1], banner_attr(app.port_discovery_note))
     add_line(stdscr, 2, "─" * (width - 1))
 
-    split_row = height // 2 if (viewer_slot is not None or history_view_active or failed_history_view_active) else height - 5
+    split_row = (
+        height // 2
+        if (viewer_slot is not None or history_view_active or failed_history_view_active or debug_view_active)
+        else height - 5
+    )
     table_bottom = max(4, split_row - 1)
 
     table_rows: List[Dict[str, str]] = []
@@ -2350,6 +2607,32 @@ def draw_ui(
             add_line(stdscr, row, f"   path: {data['path_summary']}"[: width - 1])
             row += 1
 
+    if debug_view_active:
+        add_line(stdscr, split_row - 1, "─" * (width - 1))
+        lines = app.debug_lines()
+
+        title = "Diagnostics (counters, then recent events) | d/Esc close | Up/Down scroll"
+        add_line(stdscr, split_row, title[: width - 1], curses.A_BOLD)
+
+        body_top = split_row + 1
+        body_bottom = height - 2
+        body_height = max(0, body_bottom - body_top + 1)
+        max_scroll = max(0, len(lines) - body_height)
+        viewer_scroll = max(0, min(viewer_scroll, max_scroll))
+
+        visible = lines[viewer_scroll : viewer_scroll + body_height]
+        for idx in range(body_height):
+            text = visible[idx] if idx < len(visible) else ""
+            add_line(stdscr, body_top + idx, text[: width - 1])
+
+        if lines:
+            position = f"diagnostics {viewer_scroll + 1}-{min(viewer_scroll + body_height, len(lines))} of {len(lines)}"
+        else:
+            position = "no diagnostics"
+        add_line(stdscr, height - 1, f"Status: {message} | {position}"[: width - 1])
+        stdscr.refresh()
+        return viewer_scroll
+
     if history_view_active:
         add_line(stdscr, split_row - 1, "─" * (width - 1))
         with app.lock:
@@ -2421,7 +2704,7 @@ def draw_ui(
             add_line(
                 stdscr,
                 footer_row + 2,
-                f"Press {circuit_key_hint(app.args.circuits)} for URL prompt, R retry failed URL, N replace, X clear slot, C copy URL, P paste clipboard, H success history, F failed history, or q to quit.",
+                f"Press {circuit_key_hint(app.args.circuits)} for URL prompt, R retry failed URL, N replace, X clear slot, C copy URL, P paste clipboard, H success history, F failed history, D diagnostics, or q to quit.",
             )
         else:
             prompt = f"URL for circuit {prompt_slot} (Enter submits, Esc cancels): {prompt_text}"
@@ -2478,6 +2761,7 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
     clear_prompt_active = False
     history_view_active = False
     failed_history_view_active = False
+    debug_view_active = False
     viewer_slot: Optional[int] = None
     viewer_scroll = 0
     last_paste_slot = 0
@@ -2499,6 +2783,7 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                 history_view_active,
                 clear_prompt_active,
                 failed_history_view_active,
+                debug_view_active,
             )
             next_draw = now + app.args.status_interval
 
@@ -2623,6 +2908,38 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                 history_view_active,
                 clear_prompt_active,
                 failed_history_view_active,
+            )
+            next_draw = time.monotonic() + app.args.status_interval
+            continue
+
+        if debug_view_active:
+            if key in (ord("d"), ord("D"), 27):
+                debug_view_active = False
+                viewer_scroll = 0
+                app.set_message("Diagnostics closed.")
+            elif key in (curses.KEY_UP, ord("k"), ord("K")):
+                viewer_scroll = max(0, viewer_scroll - 1)
+            elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                viewer_scroll += 1
+            elif key == curses.KEY_PPAGE:
+                viewer_scroll = max(0, viewer_scroll - 10)
+            elif key == curses.KEY_NPAGE:
+                viewer_scroll += 10
+
+            viewer_scroll = draw_ui(
+                stdscr,
+                app,
+                prompt_slot,
+                prompt_text,
+                retry_prompt_active,
+                retry_prompt_text,
+                viewer_slot,
+                viewer_scroll,
+                copy_prompt_active,
+                history_view_active,
+                clear_prompt_active,
+                failed_history_view_active,
+                debug_view_active,
             )
             next_draw = time.monotonic() + app.args.status_interval
             continue
@@ -2821,6 +3138,30 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
         if prompt_slot is None:
             if key in (ord("q"), ord("Q")):
                 break
+            if key in (ord("d"), ord("D")):
+                debug_view_active = True
+                history_view_active = False
+                failed_history_view_active = False
+                viewer_scroll = 0
+                curses.curs_set(0)
+                app.set_message("Showing diagnostics: counters and recent events.")
+                viewer_scroll = draw_ui(
+                    stdscr,
+                    app,
+                    prompt_slot,
+                    prompt_text,
+                    retry_prompt_active,
+                    retry_prompt_text,
+                    viewer_slot,
+                    viewer_scroll,
+                    copy_prompt_active,
+                    history_view_active,
+                    clear_prompt_active,
+                    failed_history_view_active,
+                    debug_view_active,
+                )
+                next_draw = time.monotonic() + app.args.status_interval
+                continue
             if key in (ord("h"), ord("H")):
                 history_view_active = True
                 failed_history_view_active = False
@@ -3270,6 +3611,9 @@ BUILTIN_DEFAULTS = {
     "connect_timeout": 20,
     "read_timeout": 30,
     "download_read_timeout": 120,
+    "http_retries": 2,
+    "retry_backoff": 1.0,
+    "min_free_space_mb": 64,
     "keep_partials": False,
     "leave_circuits": False,
     "show_paths": False,
@@ -3297,6 +3641,9 @@ CONFIG_KEY_MAP = {
     ("collector", "show_paths"): "show_paths",
     ("downloads", "output_dir"): "output_dir",
     ("downloads", "keep_partials"): "keep_partials",
+    ("downloads", "http_retries"): "http_retries",
+    ("downloads", "retry_backoff"): "retry_backoff",
+    ("downloads", "min_free_space_mb"): "min_free_space_mb",
     ("ui", "status_interval"): "status_interval",
     ("timeouts", "connect_timeout"): "connect_timeout",
     ("timeouts", "read_timeout"): "read_timeout",
@@ -3412,6 +3759,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=positive_int, help="HTTP connect timeout in seconds")
     parser.add_argument("--read-timeout", type=positive_int, help="keep-alive read timeout in seconds")
     parser.add_argument("--download-read-timeout", type=positive_int, help="download read timeout in seconds")
+    parser.add_argument(
+        "--http-retries",
+        type=nonnegative_int,
+        help="retries for transient download failures (connect/read errors, 429/5xx)",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=nonnegative_float,
+        help="base seconds of exponential backoff between download retries",
+    )
+    parser.add_argument(
+        "--min-free-space-mb",
+        type=nonnegative_int,
+        help="required free space headroom in the output directory before a download starts",
+    )
     parser.add_argument(
         "--keep-partials",
         action=argparse.BooleanOptionalAction,

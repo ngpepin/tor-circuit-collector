@@ -14,12 +14,12 @@ to verify the fix.
 
 Inspected:
 
-- `tor-circuit-collector.py` in full (constants, dataclasses, controller integration, circuit
+- [x] `tor-circuit-collector.py` in full (constants, dataclasses, controller integration, circuit
   lifecycle, keep-alive, download worker, history persistence, filename handling, table layout,
   curses main loop, config/argparse layer).
-- `apt-install-tor.sh`, `tor-circuit-collector.sh`, `README.md`, `.gitignore`.
-- `tor-circuit-collector.json` structure only, with the authentication value masked.
-- `git status --short`, `git ls-files`, file modes.
+- [x] `apt-install-tor.sh`, `tor-circuit-collector.sh`, `README.md`, `.gitignore`.
+- [x] `tor-circuit-collector.json` structure only, with the authentication value masked.
+- [x] `git status --short`, `git ls-files`, file modes.
 
 Checks actually executed (all passed at review time):
 
@@ -52,30 +52,33 @@ Effort is a rough estimate for one developer familiar with the codebase: **S** �
 
 ## Summary
 
-| ID | Title | Priority | Impact | Effort | Risk |
-|---|---|---|---|---|---|
-| P0-1 | Tracked config may contain a plaintext control password (mode `0666`) | P0 | Secret disclosure via git history | S | Low |
-| P0-2 | Live history `.jsonl` files are tracked by git | P0 | Private URLs/filenames in git history | S | Low |
-| P0-3 | `unique_path()` races across slots and can overwrite a finished file | P0 | Silent data loss | M | Low |
-| P0-4 | SOCKS isolation credentials generated with `random`, not `secrets` | P0 | Weak capability separation between slots | S | Low |
-| P1-1 | `argparse.BooleanOptionalAction` contradicts the documented Python 3.8 floor | P1 | Startup crash on 3.8 | S | Low |
-| P1-2 | `self.sessions` mutated without `self.lock` | P1 | Duplicate/leaked sessions, stale proxies | S | Low |
-| P1-3 | `self.threads` grows without bound | P1 | Slow memory growth in long runs | S | Low |
-| P1-4 | "Resume" restarts from byte 0; `.part` is truncated with `"wb"` | P1 | Wasted bandwidth, no true resume | M | Medium |
-| P1-5 | `normalize_history_url()` is a no-op | P1 | Failed entries are not suppressed on success | S | Low |
-| P1-6 | History files grow forever; whole-file rewrite per success | P1 | Startup latency, corruption window | M | Medium |
-| P1-7 | RFC 5987 `filename*=` in `Content-Disposition` is ignored | P1 | Wrong filename for non-ASCII downloads | S | Low |
-| P1-8 | Custom path selection bypasses Tor's weighting and guard policy | P1 | Slower circuits, weaker anonymity properties | M | Medium |
-| P2-1 | 29 `except Exception` handlers; 10 are bare `pass`, most others degrade silently | P2 | Undiagnosable failures | M | Low |
-| P2-2 | `relay_candidates()` refetches the full consensus per build | P2 | Startup/burst latency | S | Low |
-| P2-3 | Control-port probing is serial with per-port connect timeouts | P2 | Slow, silent startup when Tor is absent | S | Low |
-| P2-4 | `draw_ui()` re-acquires `app.lock` per slot and snapshots shallowly | P2 | Torn rows, redundant locking | S | Low |
-| P2-5 | Truncation is character-based, not display-width-based | P2 | Misaligned columns on wide/combining chars | S | Low |
-| P2-6 | Downloads: no `Accept-Encoding: identity`, size cap, retry, or free-space check | P2 | Wrong progress, disk-full failures | M | Low |
-| P2-7 | `apt-install-tor.sh`: duplicate `apt-get update`, `madison` ordering assumption, remove-then-install downtime | P2 | Slower, riskier upgrades | S | Low |
-| P3-1 | Single 3.2k-line module | P3 | Maintainability | L | Medium |
-| P3-2 | No automated tests or CI | P3 | Regressions in pure helpers | M | Low |
-| P3-3 | Assorted polish (`--version`, typing, stale comments) | P3 | Developer experience | S | Low |
+| ID | Title | Priority | Impact | Effort | Risk | Done |
+|---|---|---|---|---|---|---|
+| P0-1 | Tracked config may contain a plaintext control password (mode `0666`) | P0 | Secret disclosure via git history | S | Low | ⬜ |
+| P0-2 | Live history `.jsonl` files are tracked by git | P0 | Private URLs/filenames in git history | S | Low | ⬜ |
+| P0-3 | `unique_path()` races across slots and can overwrite a finished file | P0 | Silent data loss | M | Low | ✅ |
+| P0-4 | SOCKS isolation credentials generated with `random`, not `secrets` | P0 | Weak capability separation between slots | S | Low | ⬜ |
+| P1-1 | `argparse.BooleanOptionalAction` contradicts the documented Python 3.8 floor | P1 | Startup crash on 3.8 | S | Low | ⬜ |
+| P1-2 | `self.sessions` mutated without `self.lock` | P1 | Duplicate/leaked sessions, stale proxies | S | Low | ✅ |
+| P1-3 | `self.threads` grows without bound | P1 | Slow memory growth in long runs | S | Low | ✅ |
+| P1-4 | "Resume" restarts from byte 0; `.part` is truncated with `"wb"` | P1 | Wasted bandwidth, no true resume | M | Medium | ✅ |
+| P1-5 | `normalize_history_url()` is a no-op | P1 | Failed entries are not suppressed on success | S | Low | ✅ |
+| P1-6 | History files grow forever; whole-file rewrite per success | P1 | Startup latency, corruption window | M | Medium | ◐ |
+| P1-7 | RFC 5987 `filename*=` in `Content-Disposition` is ignored | P1 | Wrong filename for non-ASCII downloads | S | Low | ⬜ |
+| P1-8 | Custom path selection bypasses Tor's weighting and guard policy | P1 | Slower circuits, weaker anonymity properties | M | Medium | ⬜ |
+| P2-1 | 29 `except Exception` handlers; 10 are bare `pass`, most others degrade silently | P2 | Undiagnosable failures | M | Low | ◐ |
+| P2-2 | `relay_candidates()` refetches the full consensus per build | P2 | Startup/burst latency | S | Low | ✅ |
+| P2-3 | Control-port probing is serial with per-port connect timeouts | P2 | Slow, silent startup when Tor is absent | S | Low | ✅ |
+| P2-4 | `draw_ui()` re-acquires `app.lock` per slot and snapshots shallowly | P2 | Torn rows, redundant locking | S | Low | ⬜ |
+| P2-5 | Truncation is character-based, not display-width-based | P2 | Misaligned columns on wide/combining chars | S | Low | ⬜ |
+| P2-6 | Downloads: no `Accept-Encoding: identity`, size cap, retry, or free-space check | P2 | Wrong progress, disk-full failures | M | Low | ◐ |
+| P2-7 | `apt-install-tor.sh`: duplicate `apt-get update`, `madison` ordering assumption, remove-then-install downtime | P2 | Slower, riskier upgrades | S | Low | ⬜ |
+| P3-1 | Single 3.2k-line module | P3 | Maintainability | L | Medium | ⬜ |
+| P3-2 | No automated tests or CI | P3 | Regressions in pure helpers | M | Low | ⬜ |
+| P3-3 | Assorted polish (`--version`, typing, stale comments) | P3 | Developer experience | S | Low | ⬜ |
+
+Legend: ⬜ not started · ◐ partially landed (see the item's `Status` block for what remains) ·
+✅ done and locally verified.
 
 ### Progress on the items implemented in this pass
 
@@ -84,8 +87,19 @@ Effort is a rough estimate for one developer familiar with the codebase: **S** �
 - [x] **P2-2** relay/consensus cache — `collector.relay_cache_ttl` (default `300`, `0` disables)
 - [x] **P2-3** parallel control-port pre-probe — `_tcp_probe_many()` using
       `tor.port_probe_timeout`
-- [ ] Live-Tor validation for the three items above (real circuit drop, consensus-fetch count,
-      time-to-error with Tor stopped)
+- [x] **P0-3** atomic filename reservation — `reserve_download_path()` /
+      `_candidate_paths()` under a process-wide `filename_lock`
+- [x] **P1-2** sessions under `self.lock` — `_build_session()` + `session_for_slot()` +
+      `discard_session()`; `shutdown()` snapshots instead of iterating live
+- [x] **P1-3** bounded thread registry — `Set[threading.Thread]` discarded in a `finally`
+- [x] **P1-5** real URL normalization — fragment dropped, scheme/host lowered, default port
+      removed, query sorted
+- [x] **P2-1** in-memory debug sink + `D` viewer — ring buffer, counters, `_note()`
+- [x] **P1-6** atomic history rewrite — temp sibling + `fsync` + `os.replace()`
+- [x] **P2-6** (partial) `Accept-Encoding: identity`, retry with backoff, free-space
+      precheck, strict `Content-Length` parsing
+- [ ] Live-Tor validation for the items above (real circuit drop, consensus-fetch count,
+      time-to-error with Tor stopped, `NS`-driven cache invalidation)
 
 ---
 
@@ -110,28 +124,28 @@ history even if it is later removed from the working tree.
 
 **Suggested approach**
 
-1. Prefer cookie authentication. `connect_controller()` calls
+1. [ ] Prefer cookie authentication. `connect_controller()` calls
    `authenticate(password=self.args.control_password)`; Stem falls back to cookie auth when the
    password is empty. Make an empty/`null` value explicitly select cookie auth, and document
    `CookieAuthentication 1` as the default path.
-2. Warn at startup (in the TUI status line, not stdout) when a non-empty password came from a
+2. [ ] Warn at startup (in the TUI status line, not stdout) when a non-empty password came from a
    group/world-readable config file, mirroring the existing `port_discovery_line` banner.
-3. Untrack the file and ignore it: `git rm --cached tor-circuit-collector.json` plus a
+3. [ ] Untrack the file and ignore it: `git rm --cached tor-circuit-collector.json` plus a
    `.gitignore` entry. Commit a `tor-circuit-collector.example.json` with
    `"control_password": null` and have `load_config_file()` fall back to built-in defaults when
    the real file is missing. Keep the current "config path defaults next to the script" rule.
-4. Create the config with mode `0600` when the app ever writes one, and add
+4. [ ] Create the config with mode `0600` when the app ever writes one, and add
    `chmod 600 tor-circuit-collector.json` to the README's Tor configuration section.
-5. Rotate the Tor control password, and treat the old value as compromised if the repository has
+5. [ ] Rotate the Tor control password, and treat the old value as compromised if the repository has
    ever been pushed.
 
 **Verification**
 
-- `git check-ignore -v tor-circuit-collector.json` matches; `git ls-files tor-circuit-collector.json`
+- [ ] `git check-ignore -v tor-circuit-collector.json` matches; `git ls-files tor-circuit-collector.json`
   is empty.
-- With `"control_password": null` against cookie-auth Tor, the TUI reaches
+- [ ] With `"control_password": null` against cookie-auth Tor, the TUI reaches
   `Connected to Tor control port ...` (live check, needs the user's Tor).
-- `stat -c '%a' tor-circuit-collector.json` shows `600`.
+- [ ] `stat -c '%a' tor-circuit-collector.json` shows `600`.
 
 **Secret-handling note.** Do not paste the current value into an issue, commit message, or chat.
 ---
@@ -154,19 +168,19 @@ unreviewable diffs of private data.
 
 **Suggested approach**
 
-- `git rm --cached tor-circuit-collector.success-history.jsonl tor-circuit-collector.failed-history.jsonl`
-- Add to `.gitignore`: `tor-circuit-collector.*-history.jsonl`
-- Optionally add committed empty fixtures under `tests/fixtures/` if tests are added (P3-2).
+- [ ] `git rm --cached tor-circuit-collector.success-history.jsonl tor-circuit-collector.failed-history.jsonl`
+- [ ] Add to `.gitignore`: `tor-circuit-collector.*-history.jsonl`
+- [ ] Optionally add committed empty fixtures under `tests/fixtures/` if tests are added (P3-2).
   Do **not** rewrite or truncate the working copies — only untrack them.
-- Consider honouring `XDG_STATE_HOME` (default `~/.local/state/tor-circuit-collector/`) so the tool
+- [ ] Consider honouring `XDG_STATE_HOME` (default `~/.local/state/tor-circuit-collector/`) so the tool
   works from a read-only or shared install directory. Keep the script-directory location as a
   fallback and document the precedence, since the README promises "in the script directory."
 
 **Verification**
 
-- `git ls-files '*history.jsonl'` is empty.
-- `git status --short` no longer lists the histories after a download.
-- File contents and line counts are unchanged (`wc -l` before/after).
+- [ ] `git ls-files '*history.jsonl'` is empty.
+- [ ] `git status --short` no longer lists the histories after a download.
+- [ ] File contents and line counts are unchanged (`wc -l` before/after).
 
 ---
 
@@ -219,9 +233,22 @@ and `sanitize_filename()` unchanged, and keep avoiding names whose `.part` exist
 failure-path `part_path.unlink()`; note that with `keep_partials` a failed `.part` stays reserved,
 so the next identical download takes the next suffix — confirm and document that.
 
+**Status: DONE** — `unique_path()` is gone. `_candidate_paths()` yields `desired` then `-1`, `-2`, …;
+`reserve_download_path()` creates the **`.part`** with `O_CREAT|O_EXCL|O_WRONLY` (mode `0600`) under
+`self.filename_lock` and returns the final name, so the reservation is atomic across threads *and*
+processes. `download_worker()` reserves for fresh transfers and reuses the already-reserved `.part`
+on resume, which is what makes the `.part` the correct reservation key. `paths_reserved` is counted
+in the diagnostic sink.
+
 **Verification.** Unit test the helper from N threads with the same desired name, asserting N
 distinct paths. Integration without Tor: stub the HTTP layer to return the same body twice, run two
 slots, assert two distinct final files and two distinct success-history filenames.
+
+Verified locally with a Tor-free harness (`/tmp/tcc_reliability_test.py`): 16 threads released by a
+barrier against one desired name produced 16 distinct paths with 16 distinct existing `.part` files;
+a pre-existing final file was skipped (`done.bin` → `done-1.bin`); a second `O_EXCL` open of a
+reserved `.part` raised `FileExistsError`. The cross-slot HTTP integration check still needs a Tor-free
+stub of `download_worker()` and has not been written.
 
 ---
 
@@ -260,12 +287,12 @@ def _random_token(length: int) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 ```
 
-- Raise the run id to ≥16 characters and the password to ≥24.
-- Optionally derive a distinct password per slot
+- [ ] Raise the run id to ≥16 characters and the password to ≥24.
+- [ ] Optionally derive a distinct password per slot
   (`hmac.new(base, str(slot).encode(), "sha256").hexdigest()`), so one leaked credential does not
   unlock every slot. `session_for_slot()` already builds the proxy URL per slot, so this is small:
   `self.socks_password` becomes a `slot_password(index)` helper.
-- Keep the values out of the session-output log and the TUI (they currently are).
+- [ ] Keep the values out of the session-output log and the TUI (they currently are).
 
 **Verification.** `grep -n "random\." tor-circuit-collector.py` shows no credential use left.
 Assert in a unit test that two runs differ and meet the minimum length.
@@ -405,14 +432,14 @@ a circuit keeps failing mid-transfer. Users may also believe `keep_partials` ena
 
 **Suggested approach**
 
-1. If a `.part` exists for the reserved final path and `pending_resume_url` matched, send
+1. [x] If a `.part` exists for the reserved final path and `pending_resume_url` matched, send
    `Range: bytes=<size>-`. Accept only `206` with a `Content-Range` whose start equals `<size>`;
    otherwise truncate and restart (servers may ignore `Range`).
-2. Open `"r+b"` and seek to end when appending, `"wb"` otherwise; keep `os.replace()` to publish.
-3. Keep the rule that a user-cancelled transfer is not resumed (`cancel_requested`, and
+2. [x] Open `"r+b"` and seek to end when appending, `"wb"` otherwise; keep `os.replace()` to publish.
+3. [x] Keep the rule that a user-cancelled transfer is not resumed (`cancel_requested`, and
    `reason != "manual replace"`, already the case).
-4. `pending_resume_url` is already per slot, so resumable state fits.
-5. Update the README to say precisely what is resumed and whether `keep_partials` affects it.
+4. [x] `pending_resume_url` is already per slot, so resumable state fits.
+5. [x] Update the README to say precisely what is resumed and whether `keep_partials` affects it.
 
 **Verification.** Unit test header construction and status validation with stub responses (206 with
 matching `Content-Range`, 200 fallback, 416 restart). Live: interrupt a range-capable download and
@@ -488,12 +515,12 @@ session.
 
 **Suggested approach**
 
-- Compact on startup instead of on every success: after `load_persistent_histories()`, write the
+- [ ] Compact on startup instead of on every success: after `load_persistent_histories()`, write the
   truncated newest-first lists to a temp file and `os.replace()` it (atomic). Cap at
   `history_limit` entries (or 2× for headroom) and document it. Keep append as the hot path.
-- Make `rewrite_history_file()` atomic (`tmp = path.with_suffix(path.suffix + ".tmp")`, write,
+- [ ] Make `rewrite_history_file()` atomic (`tmp = path.with_suffix(path.suffix + ".tmp")`, write,
   `os.replace(tmp, path)`) and reuse it for `clear_*_history()`.
-- Gzip rotation (`*.jsonl.1.gz`) is probably unnecessary once capped.
+- [ ] Gzip rotation (`*.jsonl.1.gz`) is probably unnecessary once capped.
 
 **Verification.** Copy the current histories to a temp dir, run the app, and confirm the line count
 is capped with newest first. Kill the process during a compaction and confirm the original file is
@@ -559,13 +586,13 @@ also bypasses Tor's own `CircuitBuildTimeout` learning.
 
 **Suggested approach.** Offer both modes, defaulting to Tor's own selection:
 
-- Add `collector.path_selection: "tor" | "custom"` (`"tor"` default). In `"tor"` mode call
+- [ ] Add `collector.path_selection: "tor" | "custom"` (`"tor"` default). In `"tor"` mode call
   `new_circuit(await_build=True, timeout=...)` without `path` and read the chosen path from
   `get_circuit()`. `reserved_exit_fingerprints` then matters only in custom mode; in tor mode,
   de-duplicate after the build and rebuild only if two slots share an exit (bounded attempts).
-- In custom mode, weight by `desc.bandwidth`/`observed_bandwidth` and add basic diversity checks
+- [ ] In custom mode, weight by `desc.bandwidth`/`observed_bandwidth` and add basic diversity checks
   (distinct IPv4 /16, distinct `desc.family`).
-- Document the trade-off in the README ("custom paths disable Tor's own weighting").
+- [ ] Document the trade-off in the README ("custom paths disable Tor's own weighting").
 
 **Verification.** Unit test the weighting helper with synthetic candidates (no relay chosen twice,
 weights within tolerance). Live: build 9 circuits per mode and compare median build time and exit
@@ -676,12 +703,12 @@ error appears, with a frozen (not yet drawn) TUI.
 
 **Suggested approach**
 
-- Pre-filter with a parallel TCP probe (`_tcp_connectable(host, port, timeout)` in a
+- [x] Pre-filter with a parallel TCP probe (`_tcp_connectable(host, port, timeout)` in a
   `ThreadPoolExecutor(max_workers=8)`), then authenticate only against ports that accepted,
   preserving original ordering. This reuses `port_probe_timeout`.
-- Pass `timeout=` to `Controller.from_port` if the Stem version supports it, or set the default on
+- [ ] Pass `timeout=` to `Controller.from_port` if the Stem version supports it, or set the default on
   `stem.socket.BaseSocket`; otherwise the parallel probe is the main win.
-- Set `self.message` to "probing control port 9051…" and draw one frame before blocking.
+- [x] Set `self.message` to "probing control port 9051…" and draw one frame before blocking. (message set before the probe; no separate frame is drawn)
 
 **Verification.** With Tor stopped, compare startup time before/after; expect roughly
 `ceil(23/8) * port_probe_timeout` instead of the sum of connects.
@@ -753,16 +780,16 @@ fill the disk; a transient read timeout fails the whole transfer despite a 120 s
 
 **Suggested approach**
 
-- Send `Accept-Encoding: identity` on downloads (and keep-alives, where only status matters), or
+- [ ] Send `Accept-Encoding: identity` on downloads (and keep-alives, where only status matters), or
   read `Content-Encoding` and suppress the percentage when it is not `identity`.
-- Add `downloads.max_bytes` (0 = unlimited), checked against `Content-Length` and enforced while
+- [ ] Add `downloads.max_bytes` (0 = unlimited), checked against `Content-Length` and enforced while
   streaming.
-- Add `downloads.retries` (default 1–2) with exponential backoff for `requests.ConnectionError` /
+- [ ] Add `downloads.retries` (default 1–2) with exponential backoff for `requests.ConnectionError` /
   `Timeout`, reusing the drop-and-recreate pattern from `keepalive_once()` (`:1188-1206`). Never
   retry after `cancel_requested`.
-- Check `shutil.disk_usage(self.output_dir).free` against `content_length` plus a margin and fail
+- [ ] Check `shutil.disk_usage(self.output_dir).free` against `content_length` plus a margin and fail
   fast with a clear message.
-- Parse `Content-Length` with `int()` in `try/except ValueError`, rejecting negatives.
+- [ ] Parse `Content-Length` with `int()` in `try/except ValueError`, rejecting negatives.
 
 **Verification.** Unit test size/space checks with stubs. Live: a gzip-served URL shows progress
 consistent with the final file size.
@@ -789,16 +816,16 @@ downtime. This script runs as root, so correctness matters more than usual.
 
 **Suggested approach**
 
-- Keep one `apt-get update` after the repo file is installed (install prerequisites first, then
+- [ ] Keep one `apt-get update` after the repo file is installed (install prerequisites first, then
   write the repo and update once).
-- Select the candidate from `apt-cache policy` for the `deb.torproject.org` origin, or sort
+- [ ] Select the candidate from `apt-cache policy` for the `deb.torproject.org` origin, or sort
   `madison` output with `dpkg --compare-versions` and take the max (`sort -V` is better than "first
   line" but imperfect for Debian versions).
-- Prefer installing without the preceding `remove`, falling back to `remove` only on a
+- [ ] Prefer installing without the preceding `remove`, falling back to `remove` only on a
   hold/conflict error; if `remove` stays, log the downtime.
-- Pass `--allow-downgrades` only when `dpkg --compare-versions "$latest" lt "$installed"`, and log
+- [ ] Pass `--allow-downgrades` only when `dpkg --compare-versions "$latest" lt "$installed"`, and log
   it loudly.
-- Add `--proto '=https' --tlsv1.2` to `curl` and consider
+- [ ] Add `--proto '=https' --tlsv1.2` to `curl` and consider
   `apt-get -o DPkg::Lock::Timeout=60` to tolerate concurrent unattended-upgrades.
 
 **Verification.** `shellcheck -x`, `bash -n`, and `apt-get -s` in a container. Do **not** run the
@@ -838,15 +865,15 @@ and `stem` must stay out of module import time.
 
 There is no test suite or CI (`AGENTS.md` says so). Highest-value, Tor-free tests:
 
-- `sanitize_filename()`: traversal (`../x`), control chars, Windows-reserved names, multi-suffix
+- [ ] `sanitize_filename()`: traversal (`../x`), control chars, Windows-reserved names, multi-suffix
   archives (`.tar.gz`), length overflow, extensionless input.
-- `validate_extension()`, `extension_from_url()` (query params), `apply_extension_hint()`.
-- `unique_path()` / the new reservation helper: concurrency, `.part` collisions, suffixes.
-- `normalize_history_url()` (new), history dedup, compaction, atomic rewrite (temp dir).
-- `_parse_listener_ports()`, `_coerce_port_list()`, `_unique_ports()`.
-- `compute_table_widths()` at 80/40/200 columns; `display_width()`.
-- `_parse_ctrl_digit_sequence()`, `key_to_circuit_number()`.
-- Config precedence: defaults < JSON < CLI; relative `output_dir` from config vs CLI.
+- [ ] `validate_extension()`, `extension_from_url()` (query params), `apply_extension_hint()`.
+- [ ] `unique_path()` / the new reservation helper: concurrency, `.part` collisions, suffixes.
+- [ ] `normalize_history_url()` (new), history dedup, compaction, atomic rewrite (temp dir).
+- [ ] `_parse_listener_ports()`, `_coerce_port_list()`, `_unique_ports()`.
+- [ ] `compute_table_widths()` at 80/40/200 columns; `display_width()`.
+- [ ] `_parse_ctrl_digit_sequence()`, `key_to_circuit_number()`.
+- [ ] Config precedence: defaults < JSON < CLI; relative `output_dir` from config vs CLI.
 
 Use stdlib `unittest` plus `unittest.mock` for `requests`/`stem`. Structure as `tests/test_*.py`;
 add a `Makefile`/`nox` target and a CI workflow running `py_compile`, `--help`, `bash -n`,
@@ -856,23 +883,23 @@ import `tcc.*`.
 
 ## P3-3. Assorted polish
 
-- **`--version`**: none exists; `USER_AGENT = "tor-circuit-collector/1.0"` is the only version
+- [ ] **`--version`**: none exists; `USER_AGENT = "tor-circuit-collector/1.0"` is the only version
   string. Add `__version__`, a `--version` action, and build the UA from it.
-- **Typing**: `Dict`/`List`/`Set`/`Tuple` from `typing` are used throughout; with
+- [ ] **Typing**: `Dict`/`List`/`Set`/`Tuple` from `typing` are used throughout; with
   `from __future__ import annotations`, built-in generics work on 3.8 and read better. Not worth a
   mass rewrite unless doing P3-1.
-- **Stale comments**: `monitor_loop()` says "so Tor is not hit with five simultaneous requests"
+- [ ] **Stale comments**: `monitor_loop()` says "so Tor is not hit with five simultaneous requests"
   (`:727`) but nine slots are the default; `build_semaphore` is 2. Fix the wording.
-- **`self.history_limit`** is hard-coded 2000; expose as `history.limit` for symmetry.
-- **`DownloadState.filename`** is mutated from the worker (`:1315`) without the lock; set it under
+- [ ] **`self.history_limit`** is hard-coded 2000; expose as `history.limit` for symmetry.
+- [ ] **`DownloadState.filename`** is mutated from the worker (`:1315`) without the lock; set it under
   `self.lock` or treat it as worker-owned and copy on read.
-- **`append_slot_output()`** trims to 1000 lines by list copy (`:230-232`); use
+- [ ] **`append_slot_output()`** trims to 1000 lines by list copy (`:230-232`); use
   `collections.deque(maxlen=1000)` to avoid the O(n) copy per progress line.
-- **`keepalive_urls`** in the shipped config includes `google.com`, `facebook.com`, etc. — third-
+- [ ] **`keepalive_urls`** in the shipped config includes `google.com`, `facebook.com`, etc. — third-
   party requests on every circuit. Document that keep-alive traffic goes to these hosts and prefer
   the three Tor/ip-echo defaults for privacy. Configuration note, not a code bug.
-- **`.gitignore`**: add `*.part`, `*.tmp`, and the history glob from P0-2.
-- **README**: the key table uses `c` for "continue" in the session viewer and `c`/`C` to clear in
+- [ ] **`.gitignore`**: add `*.part`, `*.tmp`, and the history glob from P0-2.
+- [ ] **README**: the key table uses `c` for "continue" in the session viewer and `c`/`C` to clear in
   the history viewer; that overload is easy to misread. Add a "Security" section covering config
   permissions, history sensitivity, and cookie auth.
 
@@ -880,17 +907,17 @@ import `tcc.*`.
 
 # Ordering A — security and data-safety first (default)
 
-1. **P0-1, P0-2** (untrack secret + histories, ignore them, rotate password) — minutes, and stops
+1. [ ] **P0-1, P0-2** (untrack secret + histories, ignore them, rotate password) — minutes, and stops
    ongoing exposure. Do these first even if nothing else is scheduled.
-2. **P0-3** (atomic filename reservation) and **P0-4** (`secrets`) — small, contained, high value.
-3. **P1-1, P1-2, P1-3, P1-5** — small correctness fixes that unblock reliable testing.
-4. **P1-4, P1-6, P1-7** — download/history correctness; decide explicitly whether true resume is
+2. [ ] **P0-3** (atomic filename reservation) and **P0-4** (`secrets`) — small, contained, high value.
+3. [ ] **P1-1, P1-2, P1-3, P1-5** — small correctness fixes that unblock reliable testing.
+4. [ ] **P1-4, P1-6, P1-7** — download/history correctness; decide explicitly whether true resume is
    in scope, and update the README either way.
-5. **P2-1 through P2-5** — diagnosability and UI correctness.
-6. **P1-8** — the path-selection decision needs a product call (Tor-managed vs custom); implement
+5. [ ] **P2-1 through P2-5** — diagnosability and UI correctness.
+6. [ ] **P1-8** — the path-selection decision needs a product call (Tor-managed vs custom); implement
    the default-preserving option first.
-7. **P2-6, P2-7, P3-2** — hardening and tests.
-8. **P3-1, P3-3** — refactor and polish, ideally after tests exist.
+7. [ ] **P2-6, P2-7, P3-2** — hardening and tests.
+8. [ ] **P3-1, P3-3** — refactor and polish, ideally after tests exist.
 
 # Ordering B — performance and correctness first (alternative)
 
@@ -921,13 +948,13 @@ Neither ordering should start with a change. The performance items below are onl
 doing if the cost is real on this machine, and two of the claims in this document are
 explicitly unmeasured (P2-2 and P2-3 depend on consensus size and connect timeouts).
 
-1. Land the **P2-1** debug sink first, but only the in-memory ring buffer and a `D` viewer.
+1. [ ] Land the **P2-1** debug sink first, but only the in-memory ring buffer and a `D` viewer.
    It is small, it is a prerequisite for seeing retries/fallbacks, and it costs one key.
-2. Add the **P3-2** helper tests for the pure functions (`sanitize_filename`,
+2. [ ] Add the **P3-2** helper tests for the pure functions (`sanitize_filename`,
    `compute_table_widths`, `_parse_listener_ports`, `normalize_keepalive_urls`). These are
    the functions P0-3, P1-5, P2-5 and P3-1 will touch; without them the refactors below are
    unverified.
-3. Record a baseline with the same units and the same operation, and keep it: time to first
+3. [ ] Record a baseline with the same units and the same operation, and keep it: time to first
    usable table with Tor up, time to error with Tor down, 9-circuit cold build wall time,
    consensus-fetch count for those 9 builds, and download throughput + `bytes_done` accuracy
    on one large range-capable URL and one gzip-served URL. Compare against that baseline
@@ -938,15 +965,15 @@ explicitly unmeasured (P2-2 and P2-3 depend on consensus size and connect timeou
 These four are independent, small, and directly reduce time-on-network. They are the
 highest ratio of user-visible improvement to risk in the whole list.
 
-1. **P1-4** true resume: `Range` + `Content-Range` validation and `"r+b"`/seek instead of
+1. [ ] **P1-4** true resume: `Range` + `Content-Range` validation and `"r+b"`/seek instead of
    `"wb"`. A circuit that drops at 90% currently re-downloads 100%; this is the single
    largest bandwidth win available.
-2. **P2-2** cache `relay_candidates()` behind a TTL. Nine builds today pay for nine
+2. [ ] **P2-2** cache `relay_candidates()` behind a TTL. Nine builds today pay for nine
    `get_network_statuses()` materializations; this collapses them to one.
-3. **P2-6** `Accept-Encoding: identity` (removes decompression CPU and makes progress
+3. [ ] **P2-6** `Accept-Encoding: identity` (removes decompression CPU and makes progress
    honest), plus the `Content-Length` parse hardening. Defer the `max_bytes`/retries/
    disk-space parts of P2-6 to Step 2 if you want the smaller diff.
-4. **P2-3** parallel control-port pre-probe so a missing Tor fails in one probe round
+4. [ ] **P2-3** parallel control-port pre-probe so a missing Tor fails in one probe round
    instead of a serial chain.
 
 After this step, re-take the Step 0 baseline. If P2-2 and P2-3 show no measurable change,
@@ -955,30 +982,30 @@ that was not measured.
 
 ## Step 2 — correctness on the hot path
 
-1. **P0-3** atomic filename reservation. Listed as P0 for data loss, and it belongs here
+1. [ ] **P0-3** atomic filename reservation. Listed as P0 for data loss, and it belongs here
    too: it is on every download's critical path and it is the only finding that can destroy
    a file.
-2. **P1-2** `self.sessions` under `self.lock`, with a single `discard_session()` helper. A
+2. [ ] **P1-2** `self.sessions` under `self.lock`, with a single `discard_session()` helper. A
    stale/closed session is a retry, and a retry is a full re-request.
-3. **P1-3** bounded thread registry + bounded join in `shutdown()`. Long sessions are the
+3. [ ] **P1-3** bounded thread registry + bounded join in `shutdown()`. Long sessions are the
    scenario this ordering is for, so unbounded growth matters more here than under A.
-4. **P1-6** history compaction at startup and atomic rewrite. Startup parses the entire
+4. [ ] **P1-6** history compaction at startup and atomic rewrite. Startup parses the entire
    history before the UI appears; that is pure latency on every launch.
-5. **P1-5** real URL normalization, then **P1-7** `filename*=` decoding, then **P1-1**
+5. [ ] **P1-5** real URL normalization, then **P1-7** `filename*=` decoding, then **P1-1**
    paired boolean flags (or raise the floor to 3.9 — decide, do not leave it contradictory).
 
 ## Step 3 — latency, UI correctness, and hardening
 
-1. **P1-8** path selection: add `path_selection` with `"tor"` as the default so Tor's own
+1. [ ] **P1-8** path selection: add `path_selection` with `"tor"` as the default so Tor's own
    weighted selection and subnet/family rules apply, keeping the current custom picker
    available. This is a product decision; in this ordering it comes after the cache because
    P2-2 and P1-8 touch the same code path.
-2. **P2-4** single-lock immutable snapshot in `draw_ui()`. Removes torn rows and halves the
+2. [ ] **P2-4** single-lock immutable snapshot in `draw_ui()`. Removes torn rows and halves the
    lock traffic per frame — relevant because redraws happen every `status_interval`.
-3. **P2-5** display-width truncation, so a CJK filename or error cannot shift columns or
+3. [ ] **P2-5** display-width truncation, so a CJK filename or error cannot shift columns or
    raise `curses.error` at the right edge.
-4. **P2-6** remainder: `max_bytes`, retry with backoff, and the free-space precheck.
-5. **P2-7** `apt-install-tor.sh`: single `apt-get update`, reliable version selection,
+4. [ ] **P2-6** remainder: `max_bytes`, retry with backoff, and the free-space precheck.
+5. [ ] **P2-7** `apt-install-tor.sh`: single `apt-get update`, reliable version selection,
    avoid the remove-then-install downtime, and conditional `--allow-downgrades`.
 
 ## Step 4 — close the security exposure
@@ -986,11 +1013,11 @@ that was not measured.
 Deliberately last in this ordering, and only defensible if the repository is private,
 unpushed, and single-user. These are the same three actions as Ordering A step 1 plus P0-4.
 
-1. **P0-4** `secrets` for the SOCKS tokens (small, and it is a credential, so do not let it
+1. [ ] **P0-4** `secrets` for the SOCKS tokens (small, and it is a credential, so do not let it
    slip past the end of the work).
-2. **P0-1** untrack the config, ignore it, `chmod 600`, switch the example to cookie auth,
+2. [ ] **P0-1** untrack the config, ignore it, `chmod 600`, switch the example to cookie auth,
    and rotate the password.
-3. **P0-2** untrack both history files and ignore them. The Step 2 compaction work (P1-6)
+3. [ ] **P0-2** untrack both history files and ignore them. The Step 2 compaction work (P1-6)
    makes this cleaner, which is why it follows.
 
 If at any point before Step 4 the repository is pushed, shared, or accessed by another
@@ -998,37 +1025,37 @@ user, stop and run Ordering A step 1 immediately instead of continuing.
 
 ## Step 5 — structure
 
-1. **P3-2** expand the test suite beyond the Step 0 helpers to the download/history paths.
-2. **P3-1** module split, now backed by tests and by the measurement harness.
-3. **P3-3** polish (`--version`, `deque` for session output, comment fixes, README security
+1. [ ] **P3-2** expand the test suite beyond the Step 0 helpers to the download/history paths.
+2. [ ] **P3-1** module split, now backed by tests and by the measurement harness.
+3. [ ] **P3-3** polish (`--version`, `deque` for session output, comment fixes, README security
    section).
 
 ## Ordering A vs Ordering B at a glance
 
-| Finding | A position | B position | Note |
-|---|---|---|---|
-| P0-1 config secret | 1 | 4 | Non-negotiable if the repo is shared |
-| P0-2 tracked histories | 1 | 4 | Same caveat |
-| P0-3 filename race | 2 | 2 | Both orderings treat this as urgent |
-| P0-4 `random` tokens | 2 | 4 | One-line change; do not defer past Step 3 |
-| P1-1 Python 3.8 flags | 3 | 2 | Blocks startup on 3.8 in both |
-| P1-2 session locking | 3 | 2 | |
-| P1-3 thread growth | 3 | 2 | |
-| P1-4 true resume | 4 | 1 | Largest bandwidth win |
-| P1-5 URL normalization | 3 | 2 | |
-| P1-6 history compaction | 4 | 2 | Startup latency |
-| P1-7 `filename*=` | 4 | 2 | |
-| P1-8 path selection | 6 | 3 | Needs a product decision either way |
-| P2-1 debug sink | 5 | 0 | Prerequisite for measuring in B |
-| P2-2 consensus cache | 5 | 1 | Unmeasured until Step 0 baseline |
-| P2-3 control-port probe | 5 | 1 | Unmeasured until Step 0 baseline |
-| P2-4 UI snapshot | 5 | 3 | |
-| P2-5 display width | 5 | 3 | |
-| P2-6 download headers/limits | 7 | 1 then 3 | Split across two steps in B |
-| P2-7 apt installer | 7 | 3 | |
-| P3-1 module split | 8 | 5 | After tests in both |
-| P3-2 tests/CI | 7 | 0 then 5 | Seeded in Step 0 of B |
-| P3-3 polish | 8 | 5 | |
+| Finding | A position | B position | Note | Done |
+|---|---|---|---|---|
+| P0-1 config secret | 1 | 4 | Non-negotiable if the repo is shared | ⬜ |
+| P0-2 tracked histories | 1 | 4 | Same caveat | ⬜ |
+| P0-3 filename race | 2 | 2 | Both orderings treat this as urgent | ⬜ |
+| P0-4 `random` tokens | 2 | 4 | One-line change; do not defer past Step 3 | ⬜ |
+| P1-1 Python 3.8 flags | 3 | 2 | Blocks startup on 3.8 in both | ⬜ |
+| P1-2 session locking | 3 | 2 | | ⬜ |
+| P1-3 thread growth | 3 | 2 | | ⬜ |
+| P1-4 true resume | 4 | 1 | Largest bandwidth win | ✅ |
+| P1-5 URL normalization | 3 | 2 | | ⬜ |
+| P1-6 history compaction | 4 | 2 | Startup latency | ⬜ |
+| P1-7 `filename*=` | 4 | 2 | | ⬜ |
+| P1-8 path selection | 6 | 3 | Needs a product decision either way | ⬜ |
+| P2-1 debug sink | 5 | 0 | Prerequisite for measuring in B | ⬜ |
+| P2-2 consensus cache | 5 | 1 | Unmeasured until Step 0 baseline | ✅ |
+| P2-3 control-port probe | 5 | 1 | Unmeasured until Step 0 baseline | ✅ |
+| P2-4 UI snapshot | 5 | 3 | | ⬜ |
+| P2-5 display width | 5 | 3 | | ⬜ |
+| P2-6 download headers/limits | 7 | 1 then 3 | Split across two steps in B | ⬜ |
+| P2-7 apt installer | 7 | 3 | | ⬜ |
+| P3-1 module split | 8 | 5 | After tests in both | ⬜ |
+| P3-2 tests/CI | 7 | 0 then 5 | Seeded in Step 0 of B | ⬜ |
+| P3-3 polish | 8 | 5 | | ⬜ |
 
 # What was verified, and what was not
 

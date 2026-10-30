@@ -173,6 +173,7 @@ Once running:
 | `P` / `p` | Main screen | Read URL from clipboard and start it on the next available circuit. |
 | `H` / `h` | Main screen | Open successful download history (most recent first). |
 | `F` / `f` | Main screen | Open failed download history (excluding URLs that later succeeded). |
+| `D` / `d` | Main screen | Open diagnostics (counters plus recent non-fatal events). |
 | `q` | Main screen | Quit application. |
 | Digit (`1`..`9`) | Retry selector | Retry that circuit immediately (no Enter). |
 | Digit (`1`..`9`) | Replace selector | Replace that circuit immediately (no Enter). Active transfer is interrupted first. |
@@ -189,6 +190,9 @@ Once running:
 | `c` / `C` | Success/Failed history viewer | Clear the currently displayed history list. |
 | `h` or `Esc` | Success history viewer | Close success history viewer. |
 | `f` or `Esc` | Failed history viewer | Close failed history viewer. |
+| `Up` / `Down` or `k` / `j` | Diagnostics viewer | Scroll diagnostics. |
+| `PageUp` / `PageDown` | Diagnostics viewer | Scroll diagnostics faster. |
+| `d` or `Esc` | Diagnostics viewer | Close diagnostics viewer. |
 
 ### Common Workflows
 
@@ -324,7 +328,10 @@ Command-line flags override JSON values.
   },
   "downloads": {
     "output_dir": "downloads",
-    "keep_partials": false
+    "keep_partials": false,
+    "http_retries": 2,
+    "retry_backoff": 1.0,
+    "min_free_space_mb": 64
   },
   "ui": {
     "status_interval": 5
@@ -479,6 +486,60 @@ separate features: keeping a `.part` does not queue a resume.
 
 Resume also requires the server to support range requests. If it does not, the rebuild
 starts the transfer over, which is the only correct behaviour for that server.
+
+### Destination reservation
+
+A download's final filename is reserved atomically before any bytes are written: the
+`.part` file is created with `O_CREAT|O_EXCL`, so two slots downloading the same URL
+can never both claim the same final name. If a name is already taken (by a finished
+file or another slot's partial), the next `-1`, `-2`, … candidate is tried. This
+prevents a later `os.replace()` from silently overwriting an earlier completed file.
+
+### Transient-failure retries
+
+- `downloads.http_retries`: retries for transient download failures — connect/read
+  errors and HTTP `429`/`500`/`502`/`503`/`504`. Defaults to `2`; `0` disables.
+- `downloads.retry_backoff`: base seconds for exponential backoff between retries
+  (`1`, `2`, `4`, … × this value). Defaults to `1.0`.
+- Other `4xx` responses are definitive and are not retried.
+- Retry waits are interruptible: quitting or terminating the download stops them.
+
+### Free-space precheck
+
+- `downloads.min_free_space_mb`: extra headroom required in the output directory
+  before a fresh transfer starts, on top of the declared `Content-Length`. Defaults
+  to `64`. When the filesystem cannot satisfy the requirement the download fails
+  immediately with an actionable message instead of dying partway through.
+
+The check is skipped when `Content-Length` is unknown and the headroom is `0`.
+Resumed transfers do not re-check, since their partial already occupies the space.
+
+### Content-Length parsing
+
+`Content-Length` is treated as untrusted: non-numeric, negative, or malformed values
+are ignored (`total` becomes unknown) rather than raising mid-transfer. Requests are
+sent with `Accept-Encoding: identity` so the byte count matches the file size and
+`Range` resume offsets stay valid.
+
+## Diagnostics
+
+Press `D` on the main screen to open the diagnostics viewer. It shows, in order:
+
+- **Counters** — cumulative totals such as `circuit_builds`, `circuit_builds_ok`,
+  `circuit_builds_failed`, `circuit_build_seconds`, `circuits_dropped`,
+  `streams_attached`, `stream_attach_failures`, `relay_cache_hits`,
+  `relay_cache_misses`, `consensus_invalidations`, `paths_reserved`, and
+  `download_retries`.
+- **Recent events** — a bounded ring (400 lines) of non-fatal notes, including
+  circuit drops with their reason, consensus-cache invalidations, stream-attach
+  failures, and per-attempt retry reasons.
+
+Everything is in memory only; nothing is written to disk and no additional secrets
+are exposed. `Up`/`Down`, `j`/`k`, `PageUp`/`PageDown` scroll; `d` or `Esc` closes.
+
+The relay/consensus cache is invalidated automatically when Tor publishes a new
+consensus (`NS` event), so a long cache TTL cannot keep offering exit fingerprints
+Tor has already dropped.
 
 ## Troubleshooting
 
