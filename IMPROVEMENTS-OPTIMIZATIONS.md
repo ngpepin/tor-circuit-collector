@@ -77,6 +77,16 @@ Effort is a rough estimate for one developer familiar with the codebase: **S** �
 | P3-2 | No automated tests or CI | P3 | Regressions in pure helpers | M | Low |
 | P3-3 | Assorted polish (`--version`, typing, stale comments) | P3 | Developer experience | S | Low |
 
+### Progress on the items implemented in this pass
+
+- [x] **P1-4** true resume after a circuit rebuild — `Range` request, `206` + `Content-Range`
+      validation, append-mode writes, `416` fallback, partial kept across rebuilds
+- [x] **P2-2** relay/consensus cache — `collector.relay_cache_ttl` (default `300`, `0` disables)
+- [x] **P2-3** parallel control-port pre-probe — `_tcp_probe_many()` using
+      `tor.port_probe_timeout`
+- [ ] Live-Tor validation for the three items above (real circuit drop, consensus-fetch count,
+      time-to-error with Tor stopped)
+
 ---
 
 # P0 — fix first
@@ -374,6 +384,21 @@ blocking read.
   `DownloadState.bytes_done` resets to 0 in `start_download()` (`:1274-1276`).
 - `keep_partials` only controls whether the `.part` survives a failure; it is never reused.
 
+**Status: DONE** — `start_download()` reuses the kept `.part` and seeds `resumed_from` from its size;
+`download_worker()` sends `Range: bytes=<size>-` with `"ab"` append writes, validates `206` plus a
+matching `Content-Range`, falls back to a full body on `200`/mismatch, retries once without `Range`
+on `416`, and keeps rebuild-interrupted partials while still deleting them on user cancel. Live
+range/416 behaviour against a local HTTP server was exercised; real-Tor interruption is not yet
+tested.
+
+- [x] Keep the interrupted `.part` when a rebuild replaces the circuit
+- [x] Resume with `Range: bytes=<size>-` and append (`"ab"`) instead of truncating (`"wb"`)
+- [x] Accept only `206` whose `Content-Range` starts at the requested offset
+- [x] Restart from byte 0 when the server ignores `Range` or sends a mismatched range
+- [x] Retry once without `Range` on `416`
+- [x] Never resume a manually cancelled transfer
+- [ ] Verify against a real Tor circuit that drops mid-transfer
+
 **Impact.** The README and docstring say an interrupted download is "resumed", but every rebuild
 re-downloads from zero — the most expensive behaviour for large Tor downloads, and it can loop when
 a circuit keeps failing mid-transfer. Users may also believe `keep_partials` enables resume.
@@ -585,6 +610,16 @@ clipboard tool records the missing tool in the debug viewer.
 `list(get_network_statuses())` (`:945-947`) every time. Nine initial builds plus every keep-alive
 rebuild each pay for a full consensus materialization.
 
+**Status: DONE** — `relay_candidates()` now reuses a snapshot for `collector.relay_cache_ttl`
+seconds (default `300`, `0` disables) while `_fetch_relay_candidates()` keeps the original logic and
+its bootstrap/relay-count checks. The cache is guarded by `self.lock` and is stored outside
+`control_lock`.
+
+- [x] Cache relay candidates behind a TTL
+- [x] Add `collector.relay_cache_ttl` to built-in defaults, config map, argparse, JSON, and README
+- [x] Keep bootstrap and minimum-relay checks on every fetch
+- [ ] Measure the fetch count for a 9-circuit cold start (needs a live Tor instance)
+
 **Impact.** On a ~7k-relay consensus each call costs tens to hundreds of milliseconds of controller
 work and object construction, repeated for near-simultaneous builds (bounded to 2 by
 `build_semaphore`). It also holds `control_lock` while doing so, briefly delaying `attach_stream`.
@@ -622,6 +657,19 @@ produce one fetch.
 ±`control_port_scan_radius` (default 10 → 20 ports), then `9051`/`9151` — about 23 ports. Each
 failing attempt waits on the TCP connect, and the app's `port_probe_timeout` is used only by
 `_tcp_connectable()` for SOCKS, not here.
+
+**Status: DONE** — `connect_controller()` now pre-probes every candidate with
+`_tcp_probe_many()` (a `ThreadPoolExecutor` with at most 8 workers) using
+`tor.port_probe_timeout`, fails fast with one bounded error when nothing answers, and only calls
+`Controller.from_port()`/`authenticate()` for ports that accepted a connection. The status line is
+set to `Probing N control port(s)...` before the probe. Wall-clock numbers are not yet measured
+against a live system.
+
+- [x] Parallel TCP pre-probe before any Stem connection attempt
+- [x] Reuse `tor.port_probe_timeout` for the probe
+- [x] Preserve candidate ordering and authenticate only reachable ports
+- [x] Report a single bounded error when no control port is listening
+- [ ] Compare startup time with Tor stopped against the pre-change baseline
 
 **Impact.** With Tor down or on the wrong host, startup can block for tens of seconds before the
 error appears, with a frozen (not yet drawn) TUI.

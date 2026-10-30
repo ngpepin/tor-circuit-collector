@@ -37,6 +37,7 @@ import string
 import sys
 import threading
 import time
+from concurrent import futures
 from dataclasses import dataclass, field
 from email.message import Message
 from pathlib import Path
@@ -112,6 +113,12 @@ class DownloadState:
     cancel_requested: bool = False
     done: bool = False
     error: Optional[str] = None
+    part_path: Optional[Path] = None
+    final_path: Optional[Path] = None
+    resumed_from: int = 0
+    # Set when a circuit rebuild interrupts the transfer: the partial file is
+    # kept so the rebuilt circuit can continue it with a Range request.
+    keep_part_for_resume: bool = False
 
 
 @dataclass
@@ -133,6 +140,8 @@ class Slot:
     bytes_since_last_url: int = 0
     last_url: str = ""
     pending_resume_url: str = ""
+    resume_part_path: Optional[Path] = None
+    resume_final_path: Optional[Path] = None
     session_output: List[str] = field(default_factory=list)
     download: Optional[DownloadState] = None
     io_lock: threading.RLock = field(default_factory=threading.RLock)
@@ -209,6 +218,11 @@ class TorCircuitCollector:
         # while waiting for circuit construction. Stream attachment must stay
         # responsive or SOCKS requests time out while circuits are building.
         self.build_semaphore = threading.BoundedSemaphore(2)
+
+        # Consensus materialization is expensive and nine near-simultaneous
+        # builds do not need nine copies of it. Guarded by self.lock; the TTL
+        # comes from collector.relay_cache_ttl (0 disables the cache).
+        self.relay_cache: Tuple[float, List[RelayCandidate]] = (0.0, [])
 
     @staticmethod
     def _random_token(length: int) -> str:
@@ -527,6 +541,26 @@ class TorCircuitCollector:
             return False
 
     @classmethod
+    def _tcp_probe_many(cls, host: str, ports: List[int], timeout: float = 0.6, max_workers: int = 8) -> List[int]:
+        """Return the ports that accepted a TCP connection, preserving input order."""
+        if not ports:
+            return []
+        workers = max(1, min(max_workers, len(ports)))
+        reachable: Set[int] = set()
+        with futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="tcc-portprobe") as pool:
+            future_ports = {
+                pool.submit(cls._tcp_connectable, host, port, timeout): port for port in ports
+            }
+            for future in futures.as_completed(future_ports):
+                port = future_ports[future]
+                try:
+                    if future.result():
+                        reachable.add(port)
+                except Exception:
+                    continue
+        return [port for port in ports if port in reachable]
+
+    @classmethod
     def _coerce_port_list(cls, raw_ports: object) -> List[int]:
         if raw_ports is None:
             return []
@@ -631,7 +665,26 @@ class TorCircuitCollector:
         connect_errors: List[str] = []
         selected_control_port: Optional[int] = None
 
-        for port in self._candidate_control_ports():
+        candidates = self._candidate_control_ports()
+        probe_timeout = self._port_probe_timeout()
+        self.set_message(
+            f"Probing {len(candidates)} control port(s) on {self.args.control_host}..."
+        )
+
+        # A parallel TCP pre-probe collapses a serial chain of connect timeouts
+        # (about 23 ports with the default scan radius) into roughly one
+        # timeout round when Tor is absent, and skips ports with no listener.
+        reachable = self._tcp_probe_many(self.args.control_host, candidates, timeout=probe_timeout)
+        if not reachable:
+            raise RuntimeError(
+                "Could not connect/authenticate to Tor ControlPort. Ensure Tor is running with "
+                "ControlPort enabled and use --control-password if needed. "
+                f"Tried ports {candidates}; no TCP listener answered within "
+                f"{probe_timeout:.2f}s on {self.args.control_host}."
+            )
+
+        self.set_message(f"Authenticating with control port(s) {reachable}...")
+        for port in reachable:
             tried_ports.append(port)
             try:
                 candidate = Controller.from_port(address=self.args.control_host, port=port)
@@ -790,9 +843,18 @@ class TorCircuitCollector:
             if allow_auto_resume and active_download and active_state is not None and active_state.url.strip():
                 resume_url = active_state.url.strip()
                 active_state.cancel_requested = True
+                # Keep whatever bytes already landed so the rebuilt circuit can
+                # continue the transfer with a Range request instead of
+                # re-downloading from zero.
+                active_state.keep_part_for_resume = True
+                slot.resume_part_path = active_state.part_path
+                slot.resume_final_path = active_state.final_path
                 session_to_close = self.sessions.pop(slot_index, None)
 
             slot.pending_resume_url = resume_url
+            if not resume_url:
+                slot.resume_part_path = None
+                slot.resume_final_path = None
             slot.circuit_id = None
             slot.exit_fingerprint = ""
             slot.exit_nickname = ""
@@ -929,6 +991,37 @@ class TorCircuitCollector:
                     pass
 
     def relay_candidates(self) -> List[RelayCandidate]:
+        """Return relay candidates, reusing a recent consensus snapshot.
+
+        Nine initial builds plus every keep-alive rebuild would otherwise each
+        materialize the whole consensus from the control port. The cache holds
+        only relay flags, so a stale entry at worst makes Tor reject one
+        planned path and trigger a rebuild.
+        """
+        if self.controller is None:
+            raise RuntimeError("controller is not connected")
+
+        ttl = self._relay_cache_ttl()
+        if ttl > 0:
+            with self.lock:
+                cached_at, cached = self.relay_cache
+                if cached and 0.0 <= time.monotonic() - cached_at < ttl:
+                    return cached
+
+        candidates = self._fetch_relay_candidates()
+        if ttl > 0:
+            with self.lock:
+                self.relay_cache = (time.monotonic(), candidates)
+        return candidates
+
+    def _relay_cache_ttl(self) -> float:
+        try:
+            ttl = float(getattr(self.args, "relay_cache_ttl", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, ttl)
+
+    def _fetch_relay_candidates(self) -> List[RelayCandidate]:
         if self.controller is None:
             raise RuntimeError("controller is not connected")
 
@@ -1271,15 +1364,94 @@ class TorCircuitCollector:
             if slot.download is not None and not slot.download.done and not slot.download.error:
                 self.set_message(f"Circuit {slot_index} already downloading.")
                 return
+
+            # A rebuild may have handed us the paths of an interrupted transfer.
+            # Reuse them only while the partial still exists and the final file
+            # was never published; otherwise there is nothing to resume.
+            resume_part = slot.resume_part_path
+            resume_final = slot.resume_final_path
+            resumed_from = 0
+            if resume_part is not None and resume_final is not None:
+                try:
+                    if resume_part.exists() and not resume_final.exists():
+                        resumed_from = max(0, int(resume_part.stat().st_size))
+                    else:
+                        resume_part = None
+                        resume_final = None
+                except OSError:
+                    resume_part = None
+                    resume_final = None
+                    resumed_from = 0
+            slot.resume_part_path = None
+            slot.resume_final_path = None
+
             slot.last_url = url
             slot.bytes_since_last_url = 0
-            slot.download = DownloadState(url=url, filename=self.filename_from_url(url))
+            slot.download = DownloadState(
+                url=url,
+                filename=resume_final.name if resume_final is not None else self.filename_from_url(url),
+                bytes_done=resumed_from,
+                part_path=resume_part,
+                final_path=resume_final,
+                resumed_from=resumed_from,
+            )
             slot.status = "downloading"
             slot.last_error = ""
 
-        self.append_slot_output(slot_index, f"URL queued: {url}")
-        self.set_message(f"Circuit {slot_index} download started.")
+        if resumed_from > 0:
+            self.append_slot_output(
+                slot_index,
+                f"URL queued: {url} (resuming at {human_bytes(resumed_from)})",
+            )
+            self.set_message(
+                f"Circuit {slot_index} download resuming at {human_bytes(resumed_from)}."
+            )
+        else:
+            self.append_slot_output(slot_index, f"URL queued: {url}")
+            self.set_message(f"Circuit {slot_index} download started.")
         self._start_thread(target=self.download_worker, name=f"tcc-download-{slot_index}", args=(slot_index, url))
+
+    @staticmethod
+    def _content_range_start(value: str) -> Optional[int]:
+        """Return the first byte offset of a ``Content-Range`` header.
+
+        Accepts the ``bytes <start>-<end>/<total>`` form and returns ``None``
+        for anything malformed or for an unsatisfied ``bytes */<total>``.
+        """
+        match = re.fullmatch(r"\s*bytes\s+(\d+)-\d+/(\d+|\*)\s*", value or "")
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _resume_response_is_usable(self, response, resume_from: int) -> bool:
+        """True only for a 206 whose ``Content-Range`` starts at ``resume_from``.
+
+        Anything else (200 because the server ignored Range, a 206 for a
+        different range, or a missing/unparsable header) means the kept bytes
+        are not a prefix of this body and must not simply be appended to.
+        """
+        if response.status_code != 206:
+            return False
+        start = self._content_range_start(response.headers.get("Content-Range", ""))
+        return start == resume_from
+
+    def _open_download_response(self, session: "requests.Session", url: str, resume_from: int):
+        """Open the download response, retrying once without ``Range`` on HTTP 416.
+
+        A 416 means the partial file is not a usable prefix of the current
+        resource (it changed, shrank, or was written by an older run). In that
+        case the only correct action is to discard it and fetch from byte 0.
+        """
+        timeout = (self.args.connect_timeout, self.args.download_read_timeout)
+        headers = {"Connection": "keep-alive"}
+        if resume_from > 0:
+            headers["Range"] = f"bytes={resume_from}-"
+        response = session.get(url, stream=True, timeout=timeout, headers=headers)
+        if resume_from > 0 and response.status_code == 416:
+            response.close()
+            headers.pop("Range", None)
+            response = session.get(url, stream=True, timeout=timeout, headers=headers)
+        return response
 
     def download_worker(self, slot_index: int, url: str) -> None:
         slot = self.slots[slot_index - 1]
@@ -1291,55 +1463,114 @@ class TorCircuitCollector:
                 slot.download = state
             slot.status = "downloading"
             slot.last_error = ""
+            # Only a state prepared by start_download() carries resume paths.
+            resume_part = state.part_path
+            resume_final = state.final_path
+            resumed_from = max(0, int(state.resumed_from or 0)) if resume_part is not None else 0
 
         self.append_slot_output(slot_index, "Download session started.")
 
-        part_path: Optional[Path] = None
-        final_path: Optional[Path] = None
+        part_path: Optional[Path] = resume_part
+        final_path: Optional[Path] = resume_final
         try:
             with slot.io_lock:
                 session = self.session_for_slot(slot_index)
-                with session.get(
-                    url,
-                    stream=True,
-                    timeout=(self.args.connect_timeout, self.args.download_read_timeout),
-                    headers={"Connection": "keep-alive"},
-                ) as response:
-                    response.raise_for_status()
-                    total_header = response.headers.get("Content-Length")
-                    content_length = int(total_header) if total_header and total_header.isdigit() else None
-                    resolved_url = response.url or url
-                    name = self.filename_from_response(resolved_url, response.headers, guessed_name)
-                    final_path = self.unique_path(self.output_dir / name)
-                    part_path = final_path.with_suffix(final_path.suffix + ".part")
-                    state.filename = final_path.name
-                    state.total_bytes = content_length
-
-                    self.append_slot_output(
-                        slot_index,
-                        f"HTTP {response.status_code}; writing to {final_path.name}; total {human_bytes(content_length)}.",
-                    )
-
-                    next_progress_log = 1024 * 1024
-
-                    with part_path.open("wb") as fh:
-                        for chunk in response.iter_content(chunk_size=HTTP_CHUNK_SIZE):
-                            if self.stop_event.is_set():
-                                raise RuntimeError("stopped")
-                            if not chunk:
+                attempt_from = resumed_from
+                if attempt_from > 0 and part_path is not None:
+                    # The interrupted worker may have flushed one last chunk (or
+                    # the partial may have been truncated) before releasing
+                    # io_lock. The Range offset must match the bytes actually on
+                    # disk, not the size sampled by start_download().
+                    try:
+                        attempt_from = part_path.stat().st_size
+                    except OSError:
+                        attempt_from = 0
+                if final_path is not None and final_path.exists():
+                    # The final file was published after the resume was queued;
+                    # there is nothing left to continue, so reserve a new name.
+                    attempt_from = 0
+                    part_path = None
+                    final_path = None
+                # At most one downgrade to a full body: a server that ignores or
+                # rejects Range must still produce a correct file, and a second
+                # rejection means the resource itself is unusable.
+                for attempt in range(2):
+                    with self._open_download_response(session, url, attempt_from) as response:
+                        if attempt_from > 0 and not self._resume_response_is_usable(response, attempt_from):
+                            if attempt == 0:
+                                self.append_slot_output(
+                                    slot_index,
+                                    "Server did not honor the resume request; restarting from byte 0.",
+                                )
+                                attempt_from = 0
                                 continue
-                            with self.lock:
-                                if state.cancel_requested:
-                                    raise RuntimeError("terminated by user")
-                            fh.write(chunk)
-                            with self.lock:
-                                state.bytes_done += len(chunk)
-                                slot.bytes_since_last_url += len(chunk)
-                                bytes_done = state.bytes_done
-                            if bytes_done >= next_progress_log:
-                                self.append_slot_output(slot_index, f"Downloaded {human_bytes(bytes_done)}...")
-                                next_progress_log += 1024 * 1024
-                    os.replace(part_path, final_path)
+                            raise RuntimeError("server rejected the resume request")
+
+                        response.raise_for_status()
+                        total_header = response.headers.get("Content-Length")
+                        content_length = int(total_header) if total_header and total_header.isdigit() else None
+                        if content_length is not None and attempt_from > 0:
+                            content_length += attempt_from
+
+                        if part_path is None or final_path is None:
+                            # No partial reserved (fresh transfer), so pick a
+                            # destination. When a partial already exists the
+                            # paths are reused, letting the truncating write
+                            # below replace it in place instead of orphaning it.
+                            attempt_from = 0
+                            resolved_url = response.url or url
+                            name = self.filename_from_response(resolved_url, response.headers, guessed_name)
+                            final_path = self.unique_path(self.output_dir / name)
+                            part_path = final_path.with_suffix(final_path.suffix + ".part")
+                        if final_path is None or part_path is None:
+                            raise RuntimeError("could not reserve a destination path")
+
+                        state.filename = final_path.name
+                        state.total_bytes = content_length
+                        state.part_path = part_path
+                        state.final_path = final_path
+                        state.resumed_from = attempt_from
+                        with self.lock:
+                            state.bytes_done = attempt_from
+                            if slot.download is state:
+                                slot.bytes_since_last_url = 0
+
+                        if attempt_from > 0:
+                            self.append_slot_output(
+                                slot_index,
+                                f"HTTP {response.status_code}; resuming {final_path.name} at "
+                                f"{human_bytes(attempt_from)}; total {human_bytes(content_length)}.",
+                            )
+                        else:
+                            self.append_slot_output(
+                                slot_index,
+                                f"HTTP {response.status_code}; writing to {final_path.name}; total {human_bytes(content_length)}.",
+                            )
+
+                        next_progress_log = 1024 * 1024
+
+                        # "ab" appends to the kept partial so already-downloaded
+                        # bytes survive; "wb" truncates for a fresh transfer.
+                        write_mode = "ab" if attempt_from > 0 else "wb"
+                        with part_path.open(write_mode) as fh:
+                            for chunk in response.iter_content(chunk_size=HTTP_CHUNK_SIZE):
+                                if self.stop_event.is_set():
+                                    raise RuntimeError("stopped")
+                                if not chunk:
+                                    continue
+                                with self.lock:
+                                    if state.cancel_requested:
+                                        raise RuntimeError("terminated by user")
+                                fh.write(chunk)
+                                with self.lock:
+                                    state.bytes_done += len(chunk)
+                                    slot.bytes_since_last_url += len(chunk)
+                                    bytes_done = state.bytes_done
+                                if bytes_done >= next_progress_log:
+                                    self.append_slot_output(slot_index, f"Downloaded {human_bytes(bytes_done)}...")
+                                    next_progress_log += 1024 * 1024
+                        os.replace(part_path, final_path)
+                        break
 
             with self.lock:
                 if slot.download is state:
@@ -1360,7 +1591,17 @@ class TorCircuitCollector:
             )
             self.set_message(f"Circuit {slot_index} download complete: {final_path.name if final_path else state.filename}")
         except Exception as exc:
-            if part_path is not None and part_path.exists() and not self.args.keep_partials:
+            # A rebuild-interrupted transfer keeps its .part so the rebuilt
+            # circuit can continue it with a Range request; every other failure
+            # follows --keep-partials.
+            with self.lock:
+                preserve_partial = state.keep_part_for_resume
+            if (
+                part_path is not None
+                and part_path.exists()
+                and not preserve_partial
+                and not self.args.keep_partials
+            ):
                 try:
                     part_path.unlink()
                 except Exception:
@@ -2936,6 +3177,13 @@ def positive_float(value: str) -> float:
     return number
 
 
+def nonnegative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return number
+
+
 def parse_port_list(value: str) -> List[int]:
     ports = TorCircuitCollector._coerce_port_list(value)
     if not ports:
@@ -3011,6 +3259,7 @@ BUILTIN_DEFAULTS = {
     "control_port_scan_radius": 10,
     "port_probe_timeout": 0.6,
     "control_password": None,
+    "relay_cache_ttl": 300.0,
     "output_dir": ".",
     "status_interval": 5,
     "keepalive_interval": 60,
@@ -3038,6 +3287,7 @@ CONFIG_KEY_MAP = {
     ("tor", "port_probe_timeout"): "port_probe_timeout",
     ("tor", "control_password"): "control_password",
     ("collector", "circuits"): "circuits",
+    ("collector", "relay_cache_ttl"): "relay_cache_ttl",
     ("collector", "keepalive_url"): "keepalive_url",
     ("collector", "keepalive_urls"): "keepalive_urls",
     ("collector", "keepalive_interval"): "keepalive_interval",
@@ -3144,6 +3394,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="TCP connect timeout in seconds for port probes",
     )
     parser.add_argument("--control-password", help="Tor control password, if not using cookie auth")
+    parser.add_argument(
+        "--relay-cache-ttl",
+        type=nonnegative_float,
+        help="seconds to reuse a fetched relay/consensus snapshot across circuit builds (0 disables)",
+    )
     parser.add_argument("--output-dir", help="directory for completed downloads")
     parser.add_argument("--status-interval", type=positive_int, help="CLI refresh interval in seconds")
     parser.add_argument("--keepalive-interval", type=positive_int, help="seconds between keep-alive requests per idle circuit")

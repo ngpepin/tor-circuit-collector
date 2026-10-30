@@ -27,6 +27,7 @@
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
     "circuit_build_timeout": 108,
+    "relay_cache_ttl": 300,
     "leave_circuits": false,
     "show_paths": false
   },

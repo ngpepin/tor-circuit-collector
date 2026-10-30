@@ -242,7 +242,7 @@ No Enter needed for these actions:
 - Press `P` to paste the clipboard URL into the next available circuit and start immediately.
 - Press `H` to open a scrollable successful-download history pane, with most recent entries at the top.
 - Press `F` to open a scrollable failed-download history pane.
-- If a circuit drops during an active download, the app rebuilds that circuit and automatically re-initiates the interrupted URL after the circuit is ready.
+- If a circuit drops during an active download, the app rebuilds that circuit and resumes the interrupted URL after the circuit is ready (see [Resume after a circuit rebuild](#resume-after-a-circuit-rebuild)).
 - Keep-alive checks use an ordered endpoint roster (`keepalive_urls`) and automatically fall back to the next endpoint before counting a keep-alive failure.
 - Failed history excludes any URL that later succeeded.
 - If a URL fails multiple times and has not succeeded yet, only its most recent failure is shown.
@@ -318,6 +318,7 @@ Command-line flags override JSON values.
     "keepalive_interval": 60,
     "max_keepalive_failures": 2,
     "circuit_build_timeout": 108,
+    "relay_cache_ttl": 300,
     "leave_circuits": false,
     "show_paths": false
   },
@@ -372,6 +373,7 @@ Common options:
 ./tor-circuit-collector.sh --socks-port-candidates 9150,39050
 ./tor-circuit-collector.sh --control-port-scan-radius 20
 ./tor-circuit-collector.sh --port-probe-timeout 1.0
+./tor-circuit-collector.sh --relay-cache-ttl 300
 ./tor-circuit-collector.sh --keepalive-urls "https://check.torproject.org/api/ip,https://api.ipify.org?format=json,https://icanhazip.com"
 ```
 
@@ -381,6 +383,22 @@ Port discovery tuning:
 - `tor.control_port_scan_radius`: probes `control_port +/- N`.
 - `tor.socks_port_candidates`: additional SOCKS ports to probe.
 - `tor.port_probe_timeout`: TCP probe timeout in seconds for port checks.
+
+Control ports are pre-probed in parallel (up to 8 concurrent TCP connects), so a
+missing Tor fails after roughly one probe timeout instead of a serial timeout per
+candidate port.
+
+### Relay/consensus cache
+
+Building a circuit needs the relay list from Tor's consensus. Nine near-simultaneous
+builds, plus every keep-alive rebuild, would otherwise each materialize the whole
+consensus.
+
+- `collector.relay_cache_ttl`: seconds to reuse one fetched relay snapshot across
+  builds. Defaults to `300`; set `0` to disable the cache.
+- The cache stores only relay fingerprints, nicknames, and flags. A stale entry at
+  worst makes Tor reject one planned path, which triggers a normal circuit rebuild.
+- Bootstrap and "too few relays" checks still run on every fetch.
 
 Boolean options support both positive and negative forms:
 
@@ -438,6 +456,29 @@ or set:
   }
 }
 ```
+
+### Resume after a circuit rebuild
+
+If a circuit drops mid-transfer, the app keeps the partial `.part` file and, after the
+replacement circuit is ready, continues the download from where it stopped:
+
+1. The worker sends `Range: bytes=<bytes-already-written>-`.
+2. A `206 Partial Content` whose `Content-Range` starts at that byte offset is appended
+   to the existing `.part` file.
+3. If the server ignores `Range` and returns `200`, or sends a `Content-Range` that does
+   not match, the app restarts that download from byte 0 (truncating the partial).
+4. A `416 Range Not Satisfiable` retries once without `Range`, then restarts from byte 0.
+
+The resumed transfer keeps the original destination filename, and a completed download
+is still moved atomically from `.part` to the final name.
+
+Resume applies only to circuit rebuilds. A download you terminate yourself with `t` in
+the session viewer, or one that fails for another reason, is **not** resumed, and its
+partial is deleted unless `keep_partials` is enabled. `keep_partials` and resume are
+separate features: keeping a `.part` does not queue a resume.
+
+Resume also requires the server to support range requests. If it does not, the rebuild
+starts the transfer over, which is the only correct behaviour for that server.
 
 ## Troubleshooting
 
