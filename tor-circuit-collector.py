@@ -597,12 +597,18 @@ class TorCircuitCollector:
         return interrupted
 
     def trash_download(self, slot_index: int) -> None:
-        """Queue a fresh transfer of a completed slot, preserving a trash copy."""
+        """Retry an unfinished URL, or trash and restart a completed download."""
         with self.lock:
             slot = self.slots[slot_index - 1]
             state = slot.download
-            if state is None or not state.done or state.final_path is None:
-                self.set_message(f"Circuit {slot_index} has no completed download to trash.")
+            if state is None or not state.done:
+                retry_url = slot.last_url or (state.url if state is not None else "")
+                if retry_url:
+                    # Use the same entry point as R. Its readiness and active
+                    # transfer guards prevent a duplicate download.
+                    self.start_download(slot_index, retry_url)
+                else:
+                    self.set_message(f"Circuit {slot_index} has no download URL to retry.")
                 return
             if slot.rebuilding or slot.circuit_id is None:
                 self.set_message(f"Circuit {slot_index} is not ready; nothing was trashed.")
@@ -2926,7 +2932,7 @@ def draw_ui(
         add_line(stdscr, footer_row, "─" * (width - 1))
         add_line(stdscr, footer_row + 1, f"Status: {message}"[: width - 1])
         if trash_prompt_active:
-            prompt = "Trash completed download and restart (press circuit digit, Esc cancels):"
+            prompt = "Retry URL / trash completed copy (press circuit digit, Esc cancels):"
             add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
         elif retry_prompt_active:
             prompt = "Retry circuit number (press digit to retry, Esc cancels):"
@@ -2959,7 +2965,7 @@ def draw_ui(
 
     title = (
         f"Session output for circuit {viewer_slot} | URL: {selected_url} | "
-        "c continue | t terminate | T trash/restart completed | Up/Down scroll"
+        "c continue | t terminate | T retry/trash | Up/Down scroll"
     )
     add_line(stdscr, split_row, title[: width - 1], curses.A_BOLD)
 
@@ -3393,7 +3399,7 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                 break
             if key in (ord("t"), ord("T")):
                 trash_prompt_active = True
-                app.set_message(f"Press {circuit_key_hint(app.args.circuits)} to trash a completed copy and restart from byte 0; Esc cancels.")
+                app.set_message(f"Press {circuit_key_hint(app.args.circuits)} to retry a URL or trash/restart its completed copy; Esc cancels.")
                 next_draw = 0.0
                 continue
             if key in (ord("d"), ord("D")):

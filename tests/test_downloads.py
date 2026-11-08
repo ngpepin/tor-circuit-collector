@@ -342,6 +342,35 @@ class DownloadTests(unittest.TestCase):
         self.assertIs(self.app.slots[0].download, state)
         self.assertEqual(len(self.calls), 1)
 
+    def test_trash_retries_failed_download_without_trashing(self):
+        self.app.args.keep_partials = True
+        failed = self.download([Response(b"partial", {"Content-Length": "100"})])
+        self.assertIsNotNone(failed.error)
+        self.responses.append(Response(b"replacement"))
+        self.app.trash_download(1)
+        self.drain()
+        retried = self.app.slots[0].download
+        self.assertTrue(retried.done, retried.error)
+        self.assertEqual(retried.url, failed.url)
+        self.assertEqual(retried.final_path.read_bytes(), b"replacement")
+        self.assertEqual(failed.part_path.read_bytes(), b"partial")
+        self.assertFalse((self.root / ".trash").exists())
+        self.assertNotIn("Range", self.calls[-1])
+
+    def test_trash_during_download_does_not_interrupt_or_duplicate_it(self):
+        state = self.download([Response(b"body", after_body=lambda: self.app.trash_download(1))])
+        self.assertTrue(state.done, state.error)
+        self.assertFalse(state.cancel_requested)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(state.final_path.read_bytes(), b"body")
+        self.assertFalse((self.root / ".trash").exists())
+
+    def test_trash_empty_slot_reports_no_url(self):
+        self.app.trash_download(1)
+        self.assertFalse(self.queue)
+        self.assertIn("no download URL to retry", self.app.message)
+        self.assertFalse((self.root / ".trash").exists())
+
     def test_existing_destination_is_not_overwritten(self):
         (self.root / "file.bin").write_bytes(b"existing")
         state = self.download([Response(b"new")])

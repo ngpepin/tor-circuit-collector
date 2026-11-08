@@ -167,7 +167,7 @@ Once running:
 |---|---|---|
 | `1`..`9` | Main screen | Select circuit. If actively downloading, opens session viewer. Otherwise opens URL prompt for that circuit. |
 | `R` / `r` | Main screen | Retry failed download(s). If exactly one failed circuit exists, retries immediately. If multiple exist, opens retry selector. |
-| `T` / `t` | Main screen | Select a completed slot to trash its downloaded copy and restart that URL from byte zero. |
+| `T` / `t` | Main screen | Select a slot to retry its unfinished URL (like `R`), or trash its completed copy and restart from byte zero. |
 | `N` / `n` | Main screen | Open replace selector. Press circuit digit to replace that circuit with a newly built one immediately. |
 | `X` / `x` | Main screen | Open clear selector. Press circuit digit to clear that slot state to ready without rebuilding. |
 | `C` / `c` | Main screen | Open copy selector. Press circuit digit to copy that slot URL to clipboard immediately. |
@@ -177,7 +177,7 @@ Once running:
 | `D` / `d` | Main screen | Open diagnostics (counters plus recent non-fatal events). |
 | `q` | Main screen | Quit application. |
 | Digit (`1`..`9`) | Retry selector | Retry that circuit immediately (no Enter). |
-| Digit (`1`..`9`) | Trash selector | Move that slot's completed file to `downloads/.trash/` (under the configured output directory) and start fresh. |
+| Digit (`1`..`9`) | Trash selector | Retry an unfinished URL, or move the completed file to `downloads/.trash/` (under the configured output directory) and start fresh. |
 | Digit (`1`..`9`) | Replace selector | Replace that circuit immediately (no Enter). Active transfer is interrupted first. |
 | Digit (`1`..`9`) | Clear selector | Clear that circuit slot state to ready immediately (no Enter). |
 | Digit (`1`..`9`) | Copy selector | Copy that circuit URL immediately (no Enter). |
@@ -185,7 +185,7 @@ Once running:
 | `Enter` | URL prompt | Submit URL for selected circuit. |
 | `c` | Session viewer | Continue (close viewer). |
 | `t` | Session viewer | Terminate active download for viewed circuit. |
-| `T` | Session viewer | Trash/restart the viewed download if it has completed. |
+| `T` | Session viewer | Retry the viewed download like `R` if unfinished; trash/restart it if completed. |
 | `Up` / `Down` or `k` / `j` | Session viewer | Scroll output. |
 | `PageUp` / `PageDown` | Session viewer | Scroll faster. |
 | `Up` / `Down` or `k` / `j` | Success/Failed history viewer | Scroll history. |
@@ -237,7 +237,7 @@ No Enter needed for these actions:
 - If a circuit is actively downloading, pressing its number opens the lower-half session output viewer.
 - In the session output viewer, press `c` to continue (close viewer) or `t` to terminate the active download.
 - Press `R` to retry failed downloads.
-- Press `T`, then a circuit digit, to trash that slot's completed copy and force a fresh download. `Esc` cancels the selector.
+- Press `T`, then a circuit digit, to retry an unfinished URL like `R`, or trash that slot's completed copy and force a fresh download. `Esc` cancels the selector.
 - If exactly one failed circuit exists, `R` retries it immediately.
 - If multiple failed circuits exist, `R` opens a retry prompt; press the circuit digit to retry immediately.
 - Press `C` to open a copy prompt; press the circuit digit to copy that slot URL to clipboard immediately (no Enter).
@@ -468,15 +468,19 @@ for an imminent safe resume.
 
 ### Trash and restart
 
-On the main screen press **`T`, then the circuit number**. This applies to the
-completed download still associated with that slot in the current session. Its
+On the main screen press **`T`, then the circuit number**. If the slot's download
+has not completed, this retries its URL through the same path as `R`, without
+trashing a file. An already active transfer continues without being interrupted
+or duplicated; an unavailable circuit or missing URL reports a message.
+
+For a completed download still associated with the slot in the current session, its
 file is moved to a unique subdirectory of `.trash` inside the configured output
 directory, and its URL is fetched again from byte zero with a new HTTP session.
 The old copy remains recoverable; this is an application-local trash folder, not
 the desktop's trash. Existing completion history is retained as a record of past
 attempts. A missing file or unavailable circuit leaves the slot untouched and
-reports an error. In a session viewer, uppercase `T` performs the same action on
-a completed transfer; lowercase `t` still terminates an active transfer.
+reports an error. In a session viewer, uppercase `T` performs the same retry or
+trash/restart action; lowercase `t` still terminates an active transfer.
 
 ### Filenames
 
