@@ -35,6 +35,7 @@
     "output_dir": "downloads",
     "keep_partials": false,
     "http_retries": 2,
+    "integrity_retries": 2,
     "retry_backoff": 1.0,
     "min_free_space_mb": 64
   },

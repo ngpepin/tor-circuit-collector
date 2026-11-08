@@ -2,3 +2,6 @@ Tor Circuit Collector Script_files
 __pycache__
 downloads
 .loupe
+corrupted
+tor-circuit-collector.success-history.jsonl
+tor-circuit-collector.failed-history.jsonl

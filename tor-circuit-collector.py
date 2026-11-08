@@ -35,8 +35,12 @@ import signal
 import subprocess
 import string
 import sys
+import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
+import zlib
 from concurrent import futures
 from dataclasses import dataclass, field
 from email.message import Message
@@ -102,6 +106,14 @@ CONTENT_TYPE_EXTENSION_HINTS = {
 }
 
 
+class DownloadIntegrityError(RuntimeError):
+    """A received body is incomplete or fails document integrity checks."""
+
+
+class IncompleteDownloadError(DownloadIntegrityError):
+    """A valid prefix may be recoverable with a conditional range request."""
+
+
 @dataclass
 class DownloadState:
     url: str
@@ -119,6 +131,8 @@ class DownloadState:
     # Set when a circuit rebuild interrupts the transfer: the partial file is
     # kept so the rebuilt circuit can continue it with a Range request.
     keep_part_for_resume: bool = False
+    etag: str = ""
+    integrity_attempt: int = 0
 
 
 @dataclass
@@ -142,6 +156,10 @@ class Slot:
     pending_resume_url: str = ""
     resume_part_path: Optional[Path] = None
     resume_final_path: Optional[Path] = None
+    resume_etag: str = ""
+    resume_total_bytes: Optional[int] = None
+    resume_url: str = ""
+    resume_integrity_attempt: int = 0
     session_output: List[str] = field(default_factory=list)
     download: Optional[DownloadState] = None
     io_lock: threading.RLock = field(default_factory=threading.RLock)
@@ -553,6 +571,16 @@ class TorCircuitCollector:
         self.set_message(f"Terminate requested for circuit {slot_index} download.")
         return True
 
+    @staticmethod
+    def _clear_resume_state(slot: Slot) -> None:
+        """Clear the handoff metadata while holding the application's lock."""
+        slot.resume_part_path = None
+        slot.resume_final_path = None
+        slot.resume_etag = ""
+        slot.resume_total_bytes = None
+        slot.resume_url = ""
+        slot.resume_integrity_attempt = 0
+
     def clear_slot_state(self, slot_index: int) -> bool:
         interrupted = self.terminate_slot_download(slot_index)
         with self.lock:
@@ -561,11 +589,62 @@ class TorCircuitCollector:
             slot.bytes_since_last_url = 0
             slot.last_url = ""
             slot.pending_resume_url = ""
+            self._clear_resume_state(slot)
             slot.last_error = ""
             slot.session_output = []
             slot.status = "ready"
             slot.consecutive_keepalive_failures = 0
         return interrupted
+
+    def trash_download(self, slot_index: int) -> None:
+        """Queue a fresh transfer of a completed slot, preserving a trash copy."""
+        with self.lock:
+            slot = self.slots[slot_index - 1]
+            state = slot.download
+            if state is None or not state.done or state.final_path is None:
+                self.set_message(f"Circuit {slot_index} has no completed download to trash.")
+                return
+            if slot.rebuilding or slot.circuit_id is None:
+                self.set_message(f"Circuit {slot_index} is not ready; nothing was trashed.")
+                return
+        self._start_thread(
+            target=self._trash_download_worker, name=f"tcc-trash-{slot_index}", args=(slot_index, state)
+        )
+
+    def _trash_download_worker(self, slot_index: int, state: DownloadState) -> None:
+        slot = self.slots[slot_index - 1]
+        try:
+            with slot.io_lock:
+                with self.lock:
+                    if slot.download is not state or slot.rebuilding or slot.circuit_id is None or self.stop_event.is_set():
+                        self.set_message("Slot changed before trashing; nothing was trashed.")
+                        return
+                    path = state.final_path
+                    if path is None or path.parent.resolve() != self.output_dir or path.is_symlink() or not path.is_file():
+                        raise RuntimeError("completed file is missing or is not a regular file in the output directory")
+                    trash = self.output_dir / ".trash"
+                    if trash.is_symlink():
+                        raise RuntimeError("trash directory must not be a symbolic link")
+                    trash.mkdir(mode=0o700, exist_ok=True)
+                    trash_dir = Path(tempfile.mkdtemp(prefix="download-", dir=str(trash)))
+                    try:
+                        path.rename(trash_dir / path.name)
+                    except OSError:
+                        trash_dir.rmdir()
+                        raise
+                    session = self.discard_session(slot_index)
+                    slot.download = None
+                    slot.pending_resume_url = ""
+                    self._clear_resume_state(slot)
+                    self.append_slot_output(slot_index, "Completed copy moved to .trash; restarting from byte 0.")
+                    self.start_download(slot_index, state.url)
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception as exc:
+                        self._note("close trashed download session", exc)
+        except Exception as exc:
+            self.set_message(f"Could not trash/restart circuit {slot_index}: {self._short_error(exc)}")
 
     def start(self) -> None:
         self.connect_controller()
@@ -951,12 +1030,15 @@ class TorCircuitCollector:
                 active_state.keep_part_for_resume = True
                 slot.resume_part_path = active_state.part_path
                 slot.resume_final_path = active_state.final_path
+                slot.resume_etag = active_state.etag
+                slot.resume_total_bytes = active_state.total_bytes
+                slot.resume_url = active_state.url
+                slot.resume_integrity_attempt = active_state.integrity_attempt
                 session_to_close = self.discard_session(slot_index)
 
             slot.pending_resume_url = resume_url
             if not resume_url:
-                slot.resume_part_path = None
-                slot.resume_final_path = None
+                self._clear_resume_state(slot)
             slot.circuit_id = None
             slot.exit_fingerprint = ""
             slot.exit_nickname = ""
@@ -1496,7 +1578,7 @@ class TorCircuitCollector:
                     else:
                         slot.status = "ready"
 
-    def start_download(self, slot_index: int, url: str) -> None:
+    def start_download(self, slot_index: int, url: str, integrity_attempt: int = 0) -> None:
         url = url.strip()
         if not url:
             self.set_message("Download cancelled: empty URL.")
@@ -1520,6 +1602,15 @@ class TorCircuitCollector:
             # was never published; otherwise there is nothing to resume.
             resume_part = slot.resume_part_path
             resume_final = slot.resume_final_path
+            resume_etag = slot.resume_etag
+            resume_total = slot.resume_total_bytes
+            if slot.resume_url == url:
+                integrity_attempt = slot.resume_integrity_attempt
+            if slot.resume_url != url:
+                resume_part = None
+                resume_final = None
+                resume_etag = ""
+                resume_total = None
             resumed_from = 0
             if resume_part is not None and resume_final is not None:
                 try:
@@ -1532,8 +1623,7 @@ class TorCircuitCollector:
                     resume_part = None
                     resume_final = None
                     resumed_from = 0
-            slot.resume_part_path = None
-            slot.resume_final_path = None
+            self._clear_resume_state(slot)
 
             slot.last_url = url
             slot.bytes_since_last_url = 0
@@ -1544,7 +1634,11 @@ class TorCircuitCollector:
                 part_path=resume_part,
                 final_path=resume_final,
                 resumed_from=resumed_from,
+                etag=resume_etag,
+                total_bytes=resume_total,
+                integrity_attempt=integrity_attempt,
             )
+            state = slot.download
             slot.status = "downloading"
             slot.last_error = ""
 
@@ -1559,31 +1653,32 @@ class TorCircuitCollector:
         else:
             self.append_slot_output(slot_index, f"URL queued: {url}")
             self.set_message(f"Circuit {slot_index} download started.")
-        self._start_thread(target=self.download_worker, name=f"tcc-download-{slot_index}", args=(slot_index, url))
+        self._start_thread(target=self.download_worker, name=f"tcc-download-{slot_index}", args=(slot_index, url, state))
 
     @staticmethod
-    def _content_range_start(value: str) -> Optional[int]:
-        """Return the first byte offset of a ``Content-Range`` header.
-
-        Accepts the ``bytes <start>-<end>/<total>`` form and returns ``None``
-        for anything malformed or for an unsatisfied ``bytes */<total>``.
-        """
-        match = re.fullmatch(r"\s*bytes\s+(\d+)-\d+/(\d+|\*)\s*", value or "")
+    def _content_range(value: str) -> Optional[Tuple[int, int, int]]:
+        """Require a bounded range with a known, internally consistent total."""
+        match = re.fullmatch(r"\s*bytes\s+(\d+)-(\d+)/(\d+)\s*", value or "")
         if not match:
             return None
-        return int(match.group(1))
+        start, end, total = map(int, match.groups())
+        return (start, end, total) if 0 <= start <= end < total else None
 
-    def _resume_response_is_usable(self, response, resume_from: int) -> bool:
-        """True only for a 206 whose ``Content-Range`` starts at ``resume_from``.
-
-        Anything else (200 because the server ignored Range, a 206 for a
-        different range, or a missing/unparsable header) means the kept bytes
-        are not a prefix of this body and must not simply be appended to.
-        """
+    def _resume_response_is_usable(self, response, resume_from: int, state: DownloadState) -> bool:
+        """Append only the complete remainder of the same representation."""
         if response.status_code != 206:
             return False
-        start = self._content_range_start(response.headers.get("Content-Range", ""))
-        return start == resume_from
+        byte_range = self._content_range(response.headers.get("Content-Range", ""))
+        if byte_range is None:
+            return False
+        start, end, total = byte_range
+        length = self._parse_content_length(response.headers)
+        return (
+            start == resume_from and end == total - 1
+            and bool(state.etag) and response.headers.get("ETag", "") == state.etag
+            and (state.total_bytes is None or total == state.total_bytes)
+            and (length is None or length == end - start + 1)
+        )
 
     def _download_request(self, session: "requests.Session", url: str, headers: Dict[str, str]):
         """Issue one streaming GET, retrying transient transport failures.
@@ -1622,7 +1717,7 @@ class TorCircuitCollector:
 
         raise last_exc if last_exc is not None else RuntimeError("download request failed")
 
-    def _open_download_response(self, session: "requests.Session", url: str, resume_from: int):
+    def _open_download_response(self, session: "requests.Session", url: str, resume_from: int, etag: str = ""):
         """Open the download response, retrying once without ``Range`` on HTTP 416.
 
         A 416 means the partial file is not a usable prefix of the current
@@ -1632,10 +1727,12 @@ class TorCircuitCollector:
         headers = {"Connection": "keep-alive", "Accept-Encoding": "identity"}
         if resume_from > 0:
             headers["Range"] = f"bytes={resume_from}-"
+            headers["If-Range"] = etag
         response = self._download_request(session, url, headers)
         if resume_from > 0 and response.status_code == 416:
             response.close()
             headers.pop("Range", None)
+            headers.pop("If-Range", None)
             response = self._download_request(session, url, headers)
         return response
 
@@ -1680,14 +1777,67 @@ class TorCircuitCollector:
                 f"have {human_bytes(free)}"
             )
 
-    def download_worker(self, slot_index: int, url: str) -> None:
+    @staticmethod
+    def _validate_download_file(path: Path, filename: str) -> None:
+        """Catch truncated documents even when HTTP supplies no length.
+
+        These are structural checks, not a substitute for a publisher checksum.
+        ZIP CRC checking streams members without extracting them to disk.
+        """
+        suffix = Path(filename).suffix.lower()
+        if suffix == ".pdf":
+            with path.open("rb") as fh:
+                head = fh.read(1024)
+                fh.seek(max(0, path.stat().st_size - 4096))
+                tail = fh.read()
+            if b"%PDF-" not in head:
+                raise DownloadIntegrityError("invalid PDF: missing PDF header")
+            if b"%%EOF" not in tail:
+                raise IncompleteDownloadError("truncated PDF: missing EOF marker")
+            xrefs = list(re.finditer(rb"startxref\s+(\d+)\s+%%EOF", tail))
+            if not xrefs:
+                raise DownloadIntegrityError("invalid PDF: missing final startxref")
+            offset = int(xrefs[-1].group(1))
+            if offset >= path.stat().st_size:
+                raise IncompleteDownloadError("truncated PDF: cross-reference offset is outside the file")
+            with path.open("rb") as fh:
+                fh.seek(offset)
+                target = fh.read(128).lstrip()
+            if not (target.startswith(b"xref") or re.match(rb"\d+\s+\d+\s+obj\b", target)):
+                raise DownloadIntegrityError("invalid PDF: cross-reference offset does not point to an xref table/stream")
+        elif suffix in {".epub", ".zip"}:
+            if not zipfile.is_zipfile(path):
+                with path.open("rb") as fh:
+                    if fh.read(4) == b"PK\x03\x04":
+                        raise IncompleteDownloadError("truncated ZIP/EPUB: missing archive directory")
+                raise DownloadIntegrityError("invalid ZIP/EPUB header or directory")
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    if archive.testzip() is not None:
+                        raise DownloadIntegrityError("invalid ZIP/EPUB: member checksum mismatch")
+                    if suffix == ".epub":
+                        with archive.open("mimetype") as member:
+                            if member.read(64).strip() != b"application/epub+zip":
+                                raise DownloadIntegrityError("invalid EPUB mimetype")
+                        with archive.open("META-INF/container.xml") as member:
+                            container = ET.fromstring(member.read(1024 * 1024))
+                        rootfiles = container.findall(
+                            "{urn:oasis:names:tc:opendocument:xmlns:container}rootfiles/"
+                            "{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"
+                        )
+                        if not rootfiles or any(item.get("full-path") not in archive.namelist() for item in rootfiles):
+                            raise DownloadIntegrityError("invalid EPUB: missing package document")
+            except DownloadIntegrityError:
+                raise
+            except (zipfile.BadZipFile, KeyError, EOFError, ET.ParseError, zlib.error, RuntimeError, NotImplementedError) as exc:
+                raise DownloadIntegrityError("invalid or truncated ZIP/EPUB archive") from exc
+
+    def download_worker(self, slot_index: int, url: str, state: DownloadState) -> None:
         slot = self.slots[slot_index - 1]
         guessed_name = self.filename_from_url(url)
         with self.lock:
-            state = slot.download
-            if state is None or state.url != url or state.done or state.error:
-                state = DownloadState(url=url, filename=guessed_name)
-                slot.download = state
+            if slot.download is not state or state.cancel_requested:
+                return
             slot.status = "downloading"
             slot.last_error = ""
             # Only a state prepared by start_download() carries resume paths.
@@ -1699,11 +1849,14 @@ class TorCircuitCollector:
 
         part_path: Optional[Path] = resume_part
         final_path: Optional[Path] = resume_final
-        try:
-            with slot.io_lock:
+        with slot.io_lock:
+            try:
+                with self.lock:
+                    if slot.download is not state or state.cancel_requested:
+                        raise RuntimeError("download superseded or cancelled")
                 session = self.session_for_slot(slot_index)
                 attempt_from = resumed_from
-                if attempt_from > 0 and part_path is not None:
+                if part_path is not None:
                     # The interrupted worker may have flushed one last chunk (or
                     # the partial may have been truncated) before releasing
                     # io_lock. The Range offset must match the bytes actually on
@@ -1712,6 +1865,9 @@ class TorCircuitCollector:
                         attempt_from = part_path.stat().st_size
                     except OSError:
                         attempt_from = 0
+                if attempt_from > 0 and not state.etag:
+                    self.append_slot_output(slot_index, "No strong ETag for safe resume; restarting from byte 0.")
+                    attempt_from = 0
                 if final_path is not None and final_path.exists():
                     # The final file was published after the resume was queued;
                     # there is nothing left to continue, so reserve a new name.
@@ -1722,8 +1878,13 @@ class TorCircuitCollector:
                 # rejects Range must still produce a correct file, and a second
                 # rejection means the resource itself is unusable.
                 for attempt in range(2):
-                    with self._open_download_response(session, url, attempt_from) as response:
-                        if attempt_from > 0 and not self._resume_response_is_usable(response, attempt_from):
+                    with self._open_download_response(session, url, attempt_from, state.etag) as response:
+                        if attempt_from > 0 and response.status_code == 200:
+                            # If-Range mismatch, ignored Range, or a 416 fallback:
+                            # this response already contains the full body.
+                            self.append_slot_output(slot_index, "Server returned a full body; restarting from byte 0.")
+                            attempt_from = 0
+                        elif attempt_from > 0 and not self._resume_response_is_usable(response, attempt_from, state):
                             if attempt == 0:
                                 self.append_slot_output(
                                     slot_index,
@@ -1734,9 +1895,13 @@ class TorCircuitCollector:
                             raise RuntimeError("server rejected the resume request")
 
                         response.raise_for_status()
+                        if attempt_from == 0 and response.status_code != 200:
+                            raise RuntimeError(f"expected a complete HTTP 200 response, got HTTP {response.status_code}")
+                        if response.headers.get("Content-Encoding", "identity").strip().lower() not in {"", "identity"}:
+                            raise RuntimeError("server ignored Accept-Encoding: identity; cannot verify download byte offsets")
                         content_length = self._parse_content_length(response.headers)
-                        if content_length is not None and attempt_from > 0:
-                            content_length += attempt_from
+                        if attempt_from > 0:
+                            content_length = self._content_range(response.headers.get("Content-Range", ""))[2]
 
                         if part_path is None or final_path is None:
                             # No partial reserved (fresh transfer), so reserve a
@@ -1755,12 +1920,16 @@ class TorCircuitCollector:
                         if attempt_from <= 0:
                             self._ensure_free_space(content_length)
 
-                        state.filename = final_path.name
-                        state.total_bytes = content_length
-                        state.part_path = part_path
-                        state.final_path = final_path
-                        state.resumed_from = attempt_from
                         with self.lock:
+                            if state.cancel_requested or slot.download is not state:
+                                raise RuntimeError("download superseded or cancelled")
+                            state.filename = final_path.name
+                            state.total_bytes = content_length
+                            state.part_path = part_path
+                            state.final_path = final_path
+                            state.resumed_from = attempt_from
+                            etag = response.headers.get("ETag", "").strip()
+                            state.etag = etag if re.fullmatch(r'"[^"\r\n]*"', etag) else ""
                             state.bytes_done = attempt_from
                             if slot.download is state:
                                 slot.bytes_since_last_url = 0
@@ -1789,8 +1958,10 @@ class TorCircuitCollector:
                                 if not chunk:
                                     continue
                                 with self.lock:
-                                    if state.cancel_requested:
+                                    if state.cancel_requested or slot.download is not state:
                                         raise RuntimeError("terminated by user")
+                                if content_length is not None and state.bytes_done + len(chunk) > content_length:
+                                    raise DownloadIntegrityError("response exceeds expected download length")
                                 fh.write(chunk)
                                 with self.lock:
                                     state.bytes_done += len(chunk)
@@ -1799,58 +1970,120 @@ class TorCircuitCollector:
                                 if bytes_done >= next_progress_log:
                                     self.append_slot_output(slot_index, f"Downloaded {human_bytes(bytes_done)}...")
                                     next_progress_log += 1024 * 1024
-                        os.replace(part_path, final_path)
+                        if content_length is not None and state.bytes_done != content_length:
+                            raise IncompleteDownloadError(
+                                f"incomplete download: expected {content_length} bytes, received {state.bytes_done}"
+                            )
+                        self._validate_download_file(part_path, final_path.name)
+                        # A redirect to an HTML error page must not evade the
+                        # check merely by supplying an .html filename.
+                        if Path(guessed_name).suffix.lower() != final_path.suffix.lower():
+                            self._validate_download_file(part_path, guessed_name)
+                        with self.lock:
+                            if self.stop_event.is_set() or state.cancel_requested or slot.download is not state:
+                                raise RuntimeError("download stopped or cancelled before completion")
+                            if final_path.exists():
+                                raise RuntimeError("destination appeared during download; refusing to overwrite it")
+                            os.replace(part_path, final_path)
+                            # Publishing and marking done must be indivisible
+                            # from a circuit rebuild's view of this state.
+                            state.done = True
+                            state.ended_at = time.monotonic()
                         break
 
-            with self.lock:
-                if slot.download is state:
-                    state.done = True
+                with self.lock:
+                    if slot.download is state:
+                        slot.status = "ready"
+                        slot.last_ok_at = time.monotonic()
+                        slot.last_error = ""
+                self.append_download_history(
+                    slot_index,
+                    state.url,
+                    final_path.name if final_path else state.filename,
+                    state.bytes_done,
+                )
+                self.append_slot_output(
+                    slot_index,
+                    f"Download complete: {final_path.name if final_path else state.filename} ({human_bytes(state.bytes_done)}).",
+                )
+                self.set_message(f"Circuit {slot_index} download complete: {final_path.name if final_path else state.filename}")
+            except Exception as exc:
+                # A rebuild-interrupted transfer keeps its .part so the rebuilt
+                # circuit can continue it with a Range request; every other failure
+                # follows --keep-partials.
+                with self.lock:
+                    integrity_failure = isinstance(exc, DownloadIntegrityError) or (
+                        requests is not None and isinstance(exc, requests.exceptions.ChunkedEncodingError)
+                    )
+                    retry_limit = self.args.integrity_retries
+                    retry = (
+                        integrity_failure and state.integrity_attempt < retry_limit
+                        and not state.cancel_requested and not self.stop_event.is_set()
+                        and slot.download is state and not slot.rebuilding and slot.circuit_id is not None
+                    )
+                    incomplete = isinstance(exc, IncompleteDownloadError) or (
+                        requests is not None and isinstance(exc, requests.exceptions.ChunkedEncodingError)
+                    )
+                    resume_retry = (
+                        retry and incomplete and bool(state.etag) and state.bytes_done > 0
+                        and (state.total_bytes is None or state.bytes_done < state.total_bytes)
+                        and part_path is not None and final_path is not None
+                    )
+                    preserve_partial = state.keep_part_for_resume or resume_retry
+                if (
+                    part_path is not None
+                    and part_path.exists()
+                    and not preserve_partial
+                    and not self.args.keep_partials
+                ):
+                    try:
+                        part_path.unlink()
+                    except Exception:
+                        pass
+                with self.lock:
+                    state.error = self._short_error(exc)
                     state.ended_at = time.monotonic()
-                    slot.status = "ready"
-                    slot.last_ok_at = time.monotonic()
-                    slot.last_error = ""
-            self.append_download_history(
-                slot_index,
-                state.url,
-                final_path.name if final_path else state.filename,
-                state.bytes_done,
-            )
-            self.append_slot_output(
-                slot_index,
-                f"Download complete: {final_path.name if final_path else state.filename} ({human_bytes(state.bytes_done)}).",
-            )
-            self.set_message(f"Circuit {slot_index} download complete: {final_path.name if final_path else state.filename}")
-        except Exception as exc:
-            # A rebuild-interrupted transfer keeps its .part so the rebuilt
-            # circuit can continue it with a Range request; every other failure
-            # follows --keep-partials.
-            with self.lock:
-                preserve_partial = state.keep_part_for_resume
-            if (
-                part_path is not None
-                and part_path.exists()
-                and not preserve_partial
-                and not self.args.keep_partials
-            ):
-                try:
-                    part_path.unlink()
-                except Exception:
-                    pass
-            with self.lock:
-                state.error = self._short_error(exc)
-                state.ended_at = time.monotonic()
-                if slot.download is state:
-                    slot.status = "download failed"
-                    slot.last_error = state.error
-            self.append_failed_download_history(
-                slot_index,
-                state.url,
-                final_path.name if final_path else state.filename,
-                state.bytes_done,
-                state.error,
-            )
-            self.append_slot_output(slot_index, f"Download failed: {state.error}")
-            self.set_message(f"Circuit {slot_index} download failed: {state.error}")
+                    if slot.download is state:
+                        slot.status = "download failed"
+                        slot.last_error = state.error
+                self.append_failed_download_history(
+                    slot_index,
+                    state.url,
+                    final_path.name if final_path else state.filename,
+                    state.bytes_done,
+                    state.error,
+                )
+                self.append_slot_output(slot_index, f"Download failed: {state.error}")
+                self.set_message(f"Circuit {slot_index} download failed: {state.error}")
+                with self.lock:
+                    retry = (
+                        retry
+                        and not state.cancel_requested and not self.stop_event.is_set()
+                        and slot.download is state and not slot.rebuilding and slot.circuit_id is not None
+                    )
+                    if retry:
+                        session_to_close = self.discard_session(slot_index)
+                        slot.pending_resume_url = ""
+                        self._clear_resume_state(slot)
+                        if resume_retry:
+                            slot.resume_part_path = part_path
+                            slot.resume_final_path = final_path
+                            slot.resume_etag = state.etag
+                            slot.resume_total_bytes = state.total_bytes
+                            slot.resume_url = url
+                            slot.resume_integrity_attempt = state.integrity_attempt + 1
+                        retry_mode = "resuming verified representation" if resume_retry else "restarting from byte 0"
+                        self.append_slot_output(
+                            slot_index,
+                            f"Integrity check failed; recovery {state.integrity_attempt + 1}/{retry_limit}: {retry_mode}.",
+                        )
+                        self.record("integrity_retries")
+                        self.start_download(slot_index, url, integrity_attempt=state.integrity_attempt + 1)
+                if retry and session_to_close is not None:
+                    try:
+                        session_to_close.close()
+                    except Exception as close_exc:
+                        self._note("close invalid download session", close_exc)
 
     @staticmethod
     def filename_from_url(url: str) -> str:
@@ -2483,6 +2716,7 @@ def draw_ui(
     clear_prompt_active: bool = False,
     failed_history_view_active: bool = False,
     debug_view_active: bool = False,
+    trash_prompt_active: bool = False,
 ) -> int:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
@@ -2691,7 +2925,10 @@ def draw_ui(
         footer_row = height - 4
         add_line(stdscr, footer_row, "─" * (width - 1))
         add_line(stdscr, footer_row + 1, f"Status: {message}"[: width - 1])
-        if retry_prompt_active:
+        if trash_prompt_active:
+            prompt = "Trash completed download and restart (press circuit digit, Esc cancels):"
+            add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
+        elif retry_prompt_active:
             prompt = "Retry circuit number (press digit to retry, Esc cancels):"
             add_line(stdscr, footer_row + 2, prompt[: width - 1], curses.A_BOLD)
         elif copy_prompt_active:
@@ -2704,7 +2941,7 @@ def draw_ui(
             add_line(
                 stdscr,
                 footer_row + 2,
-                f"Press {circuit_key_hint(app.args.circuits)} for URL prompt, R retry failed URL, N replace, X clear slot, C copy URL, P paste clipboard, H success history, F failed history, D diagnostics, or q to quit.",
+                f"Press {circuit_key_hint(app.args.circuits)} for URL prompt, R retry, T trash/restart, N replace, X clear slot, C copy URL, P paste clipboard, H success history, F failed history, D diagnostics, or q to quit.",
             )
         else:
             prompt = f"URL for circuit {prompt_slot} (Enter submits, Esc cancels): {prompt_text}"
@@ -2722,7 +2959,7 @@ def draw_ui(
 
     title = (
         f"Session output for circuit {viewer_slot} | URL: {selected_url} | "
-        "c continue | t terminate | Up/Down scroll"
+        "c continue | t terminate | T trash/restart completed | Up/Down scroll"
     )
     add_line(stdscr, split_row, title[: width - 1], curses.A_BOLD)
 
@@ -2758,6 +2995,7 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
     retry_prompt_text = ""
     copy_prompt_active = False
     replace_prompt_active = False
+    trash_prompt_active = False
     clear_prompt_active = False
     history_view_active = False
     failed_history_view_active = False
@@ -2784,6 +3022,7 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                 clear_prompt_active,
                 failed_history_view_active,
                 debug_view_active,
+                trash_prompt_active,
             )
             next_draw = now + app.args.status_interval
 
@@ -2803,7 +3042,9 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
                 viewer_slot = None
                 viewer_scroll = 0
                 app.set_message("Session viewer closed.")
-            elif key in (ord("t"), ord("T")):
+            elif key == ord("T"):
+                app.trash_download(viewer_slot)
+            elif key == ord("t"):
                 if not app.terminate_slot_download(viewer_slot):
                     app.set_message(f"Circuit {viewer_slot} has no active download to terminate.")
             elif key in (curses.KEY_UP, ord("k"), ord("K")):
@@ -2979,6 +3220,18 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
             next_draw = time.monotonic() + app.args.status_interval
             continue
 
+        if trash_prompt_active:
+            if key == 27:
+                trash_prompt_active = False
+                app.set_message("Trash/restart cancelled.")
+            else:
+                selected = key_to_circuit_number(key, app.args.circuits)
+                if selected is not None:
+                    trash_prompt_active = False
+                    app.trash_download(selected)
+            next_draw = 0.0
+            continue
+
         if retry_prompt_active:
             if key == 27:
                 retry_prompt_active = False
@@ -3138,6 +3391,11 @@ def curses_main(stdscr, app: TorCircuitCollector) -> None:
         if prompt_slot is None:
             if key in (ord("q"), ord("Q")):
                 break
+            if key in (ord("t"), ord("T")):
+                trash_prompt_active = True
+                app.set_message(f"Press {circuit_key_hint(app.args.circuits)} to trash a completed copy and restart from byte 0; Esc cancels.")
+                next_draw = 0.0
+                continue
             if key in (ord("d"), ord("D")):
                 debug_view_active = True
                 history_view_active = False
@@ -3612,6 +3870,7 @@ BUILTIN_DEFAULTS = {
     "read_timeout": 30,
     "download_read_timeout": 120,
     "http_retries": 2,
+    "integrity_retries": 2,
     "retry_backoff": 1.0,
     "min_free_space_mb": 64,
     "keep_partials": False,
@@ -3642,6 +3901,7 @@ CONFIG_KEY_MAP = {
     ("downloads", "output_dir"): "output_dir",
     ("downloads", "keep_partials"): "keep_partials",
     ("downloads", "http_retries"): "http_retries",
+    ("downloads", "integrity_retries"): "integrity_retries",
     ("downloads", "retry_backoff"): "retry_backoff",
     ("downloads", "min_free_space_mb"): "min_free_space_mb",
     ("ui", "status_interval"): "status_interval",
@@ -3765,6 +4025,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="retries for transient download failures (connect/read errors, 429/5xx)",
     )
     parser.add_argument(
+        "--integrity-retries",
+        type=nonnegative_int,
+        help="automatic recovery attempts after incomplete downloads or failed document integrity checks (default: 2)",
+    )
+    parser.add_argument(
         "--retry-backoff",
         type=nonnegative_float,
         help="base seconds of exponential backoff between download retries",
@@ -3791,6 +4056,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     args = parser.parse_args(argv)
+    if not isinstance(args.integrity_retries, int) or isinstance(args.integrity_retries, bool) or args.integrity_retries < 0:
+        parser.error("downloads.integrity_retries must be a nonnegative integer")
 
     # Normalize after CLI overrides too. CLI relative output-dir remains relative to cwd,
     # unlike config relative output_dir which is already resolved relative to the config file.

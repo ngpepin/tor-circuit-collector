@@ -167,6 +167,7 @@ Once running:
 |---|---|---|
 | `1`..`9` | Main screen | Select circuit. If actively downloading, opens session viewer. Otherwise opens URL prompt for that circuit. |
 | `R` / `r` | Main screen | Retry failed download(s). If exactly one failed circuit exists, retries immediately. If multiple exist, opens retry selector. |
+| `T` / `t` | Main screen | Select a completed slot to trash its downloaded copy and restart that URL from byte zero. |
 | `N` / `n` | Main screen | Open replace selector. Press circuit digit to replace that circuit with a newly built one immediately. |
 | `X` / `x` | Main screen | Open clear selector. Press circuit digit to clear that slot state to ready without rebuilding. |
 | `C` / `c` | Main screen | Open copy selector. Press circuit digit to copy that slot URL to clipboard immediately. |
@@ -176,6 +177,7 @@ Once running:
 | `D` / `d` | Main screen | Open diagnostics (counters plus recent non-fatal events). |
 | `q` | Main screen | Quit application. |
 | Digit (`1`..`9`) | Retry selector | Retry that circuit immediately (no Enter). |
+| Digit (`1`..`9`) | Trash selector | Move that slot's completed file to `downloads/.trash/` (under the configured output directory) and start fresh. |
 | Digit (`1`..`9`) | Replace selector | Replace that circuit immediately (no Enter). Active transfer is interrupted first. |
 | Digit (`1`..`9`) | Clear selector | Clear that circuit slot state to ready immediately (no Enter). |
 | Digit (`1`..`9`) | Copy selector | Copy that circuit URL immediately (no Enter). |
@@ -183,6 +185,7 @@ Once running:
 | `Enter` | URL prompt | Submit URL for selected circuit. |
 | `c` | Session viewer | Continue (close viewer). |
 | `t` | Session viewer | Terminate active download for viewed circuit. |
+| `T` | Session viewer | Trash/restart the viewed download if it has completed. |
 | `Up` / `Down` or `k` / `j` | Session viewer | Scroll output. |
 | `PageUp` / `PageDown` | Session viewer | Scroll faster. |
 | `Up` / `Down` or `k` / `j` | Success/Failed history viewer | Scroll history. |
@@ -234,6 +237,7 @@ No Enter needed for these actions:
 - If a circuit is actively downloading, pressing its number opens the lower-half session output viewer.
 - In the session output viewer, press `c` to continue (close viewer) or `t` to terminate the active download.
 - Press `R` to retry failed downloads.
+- Press `T`, then a circuit digit, to trash that slot's completed copy and force a fresh download. `Esc` cancels the selector.
 - If exactly one failed circuit exists, `R` retries it immediately.
 - If multiple failed circuits exist, `R` opens a retry prompt; press the circuit digit to retry immediately.
 - Press `C` to open a copy prompt; press the circuit digit to copy that slot URL to clipboard immediately (no Enter).
@@ -330,6 +334,7 @@ Command-line flags override JSON values.
     "output_dir": "downloads",
     "keep_partials": false,
     "http_retries": 2,
+    "integrity_retries": 2,
     "retry_backoff": 1.0,
     "min_free_space_mb": 64
   },
@@ -430,7 +435,50 @@ On shutdown, the script attempts to restore the previous `__LeaveStreamsUnattach
 
 ## Downloads
 
-Downloads are streamed in chunks and written first to a `.part` file. When a download completes, the `.part` file is atomically moved to the final filename.
+Downloads are streamed in chunks and written first to a `.part` file. Only after byte-count and document integrity checks pass is the `.part` file atomically moved to the final filename and recorded as successful.
+
+### Integrity checks and automatic recovery
+
+- When HTTP supplies a length, the received byte count must match exactly. Some
+  older Requests/urllib3 combinations silently finish a short response; the
+  collector checks the count itself rather than relying on a network exception.
+- PDFs must have a PDF header, an ending `%%EOF` marker, and a final `startxref`
+  offset pointing inside the file to a cross-reference table or object.
+- EPUB/ZIP archives must have a readable archive directory and pass every member's
+  CRC check. EPUBs must also have the expected `mimetype`, a parseable
+  `META-INF/container.xml`, and the package document(s) it references.
+- These checks detect truncation and common structural damage. They do not fully
+  validate PDF page content, EPUB rendering, or authenticity; a publisher's
+  checksum remains stronger evidence of an exact copy.
+
+A failed integrity check automatically triggers up to **two recovery attempts**.
+For an incomplete body with a strong ETag, recovery first preserves the partial
+and requests only the missing suffix using `Range` and `If-Range`. The response
+must identify the same representation and supply the complete remainder. The
+combined file is checked again before publication. If the representation changed,
+the server rejects ranges, no strong ETag is available, or the damaged bytes
+cannot be localized (for example, a ZIP CRC failure), recovery restarts from zero
+with a new HTTP session. Requests still use the selected Tor circuit.
+
+Set `downloads.integrity_retries` or `--integrity-retries N` to change the limit;
+`0` disables automatic recovery. The counter survives circuit rebuilds. On
+exhaustion the slot shows an error, and `R` can retry manually. Rejected files are
+never recorded as successful. Partials follow `keep_partials`, except while kept
+for an imminent safe resume.
+
+### Trash and restart
+
+On the main screen press **`T`, then the circuit number**. This applies to the
+completed download still associated with that slot in the current session. Its
+file is moved to a unique subdirectory of `.trash` inside the configured output
+directory, and its URL is fetched again from byte zero with a new HTTP session.
+The old copy remains recoverable; this is an application-local trash folder, not
+the desktop's trash. Existing completion history is retained as a record of past
+attempts. A missing file or unavailable circuit leaves the slot untouched and
+reports an error. In a session viewer, uppercase `T` performs the same action on
+a completed transfer; lowercase `t` still terminates an active transfer.
+
+### Filenames
 
 If the server provides a `Content-Disposition` filename, that name is used. Otherwise, the filename is inferred from the final response URL (path and common filename query parameters). Existing filenames are not overwritten; the script appends `-1`, `-2`, and so on.
 
@@ -469,22 +517,24 @@ or set:
 If a circuit drops mid-transfer, the app keeps the partial `.part` file and, after the
 replacement circuit is ready, continues the download from where it stopped:
 
-1. The worker sends `Range: bytes=<bytes-already-written>-`.
-2. A `206 Partial Content` whose `Content-Range` starts at that byte offset is appended
-   to the existing `.part` file.
-3. If the server ignores `Range` and returns `200`, or sends a `Content-Range` that does
-   not match, the app restarts that download from byte 0 (truncating the partial).
+1. If the original response supplied a strong ETag, the worker sends
+   `Range: bytes=<bytes-already-written>-` and `If-Range: <original-etag>`.
+2. A `206 Partial Content` is appended only if its ETag matches, its `Content-Range`
+   starts at that offset and extends to the end, and its total agrees with the
+   original total when known. The received length must match before completion.
+3. Without a strong ETag, or if the response ignores `Range`, changes representation,
+   or supplies an inconsistent range, the app restarts from byte 0 (truncating the partial).
 4. A `416 Range Not Satisfiable` retries once without `Range`, then restarts from byte 0.
 
 The resumed transfer keeps the original destination filename, and a completed download
 is still moved atomically from `.part` to the final name.
 
-Resume applies only to circuit rebuilds. A download you terminate yourself with `t` in
-the session viewer, or one that fails for another reason, is **not** resumed, and its
-partial is deleted unless `keep_partials` is enabled. `keep_partials` and resume are
-separate features: keeping a `.part` does not queue a resume.
+Resume applies to circuit rebuilds and automatic recovery of incomplete responses.
+A download you terminate yourself with `t` in the session viewer is **not** resumed,
+and its partial is deleted unless `keep_partials` is enabled. Keeping a `.part` alone
+does not queue a resume.
 
-Resume also requires the server to support range requests. If it does not, the rebuild
+Resume also requires the server to support ranges and supply a strong ETag. Otherwise, the rebuild
 starts the transfer over, which is the only correct behaviour for that server.
 
 ### Destination reservation
@@ -519,7 +569,14 @@ Resumed transfers do not re-check, since their partial already occupies the spac
 `Content-Length` is treated as untrusted: non-numeric, negative, or malformed values
 are ignored (`total` becomes unknown) rather than raising mid-transfer. Requests are
 sent with `Accept-Encoding: identity` so the byte count matches the file size and
-`Range` resume offsets stay valid.
+`Range` resume offsets stay valid. A server that nevertheless sends an encoded body
+is rejected rather than mixing encoded range offsets with decoded file bytes.
+Malformed or absent lengths cannot establish completeness; document checks still run.
+
+### Offline regression tests
+
+Run `python3 -m unittest discover -s tests -v`. Tests use synthetic responses and
+temporary files; they do not contact Tor or read/write user downloads or histories.
 
 ## Diagnostics
 
